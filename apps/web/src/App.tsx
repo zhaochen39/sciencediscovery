@@ -183,6 +183,7 @@ import {
 } from "./timeline/RunTimeline.js";
 import { globalSettingsDraft, ScopedSettingsEditor } from "./ScopedSettingsEditor.js";
 import { PluginWebHost } from "./plugins/host.js";
+import { ResearchPackageDialogs, type ResearchPackageDialogTarget } from "./research-package/ResearchPackageActions.js";
 import type { PluginComposition } from "./api/plugins.js";
 import { duplicateModelProfileId } from "./modelLabels.js";
 import { ArtifactLifecycleControls, ArtifactLifecycleProvider } from "./ArtifactLifecycleControls.js";
@@ -1203,6 +1204,8 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
   const [lifecycleBusy, setLifecycleBusy] = useState(false);
   const [openProjectMenuId, setOpenProjectMenuId] = useState<string>();
   const [openSessionMenuId, setOpenSessionMenuId] = useState<string>();
+  const [researchPackageDialog, setResearchPackageDialog] = useState<ResearchPackageDialogTarget>();
+  const [researchPackageImportAllowed, setResearchPackageImportAllowed] = useState(false);
   const [sessionFilterOpen, setSessionFilterOpen] = useState(false);
   const [projectsExpanded, setProjectsExpanded] = useState(true);
   const [sessionsExpanded, setSessionsExpanded] = useState(true);
@@ -1922,6 +1925,7 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
     let cancelled = false;
     if (!activeProjectId) {
       setSessions([]);
+      setResearchPackageImportAllowed(false);
       setArtifacts([]);
       setArtifactOutputs([]);
       setArtifactSessions([]);
@@ -1936,6 +1940,7 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
       return () => { cancelled = true; };
     }
     setSessionsLoaded(false);
+    setResearchPackageImportAllowed(false);
     setArtifacts([]);
     setArtifactOutputs([]);
     setArtifactSessions([]);
@@ -1943,14 +1948,12 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
     void Promise.all([
       client.listSessions(activeProjectId, sessionListState),
       client.listSessions(activeProjectId, "all"),
-      client.listProjectArtifacts(activeProjectId),
       client.getProjectSettings(activeProjectId),
-    ]).then(([items, allSessions, projectArtifacts, settings]) => {
+    ]).then(async ([items, allSessions, settings]) => {
       if (cancelled) return;
       setSessions(items);
       setArtifactSessions(allSessions);
       setArtifactSessionCatalogProjectId(activeProjectId);
-      setArtifacts(projectArtifacts);
       setProjectSettings(settings);
       // A Session named by the URL wins over the "first item" default, but
       // only once the list of the Project it was paired with has loaded.
@@ -1968,6 +1971,9 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
         const target = findResourceTarget("session", pendingSettings.id ?? nextSessionId ?? "", [], items);
         if (target) void openScopedSettings(target);
       }
+      // Filtering may keep the same active Session, so its effect will not rerun.
+      const scopedArtifacts = nextSessionId ? await client.listArtifacts(nextSessionId) : [];
+      if (!cancelled && activeSessionIdRef.current === nextSessionId) setArtifacts(scopedArtifacts);
     }).catch((reason: Error) => {
       if (!cancelled) setError(reason);
     }).finally(() => {
@@ -1979,7 +1985,9 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
   async function refreshSession(sessionId = activeSessionId): Promise<void> {
     if (!sessionId) {
       setSession(undefined);
+      setResearchPackageImportAllowed(false);
       setFiles([]);
+      setArtifacts([]);
       setPermissionEpoch(undefined);
       setPermissionRequests([]);
       setSessionUsage(undefined);
@@ -2001,7 +2009,7 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
       return;
     }
     const refreshSummaryRevision = latestSessionSummaries.current.get(sessionId)?.revision ?? 0;
-    const [detail, workspaceFiles, epoch, permissionRequestItems, permissionGrantItems, usageSummary, sessionRunItems, executionRunItems, artifactDerivations, manifests, artifactReviewRuns, reviewerTasks, invocations, claimItems, linkItems, subagentItems, remoteJobItems, artifactOutputItems] = await Promise.all([
+    const [detail, workspaceFiles, epoch, permissionRequestItems, permissionGrantItems, usageSummary, sessionRunItems, executionRunItems, artifactDerivations, manifests, artifactReviewRuns, reviewerTasks, invocations, claimItems, linkItems, subagentItems, remoteJobItems, artifactOutputItems, researchPackageImportEligibility] = await Promise.all([
       client.getSession(sessionId),
       client.listFiles(sessionId),
       client.getPermissionEpoch(sessionId),
@@ -2020,6 +2028,7 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
       client.listSubagents(sessionId),
       client.listRemoteJobs(sessionId),
       client.listArtifactOutputs(sessionId),
+      client.canImportResearchPackage(sessionId).catch(() => ({ canImport: false })),
     ]);
     const activeRun = selectSessionReplayRun(sessionRunItems.filter((run) => isActiveRunStatus(run.status)));
     const replayEvents = activeRun ? await client.listRunEvents(sessionId, activeRun.id) : [];
@@ -2051,7 +2060,7 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
           return [runId, []] as const; // subagents recorded before child streams existed
         }
       })));
-    const projectArtifacts = await client.listProjectArtifacts(detail.projectId);
+    const sessionArtifacts = await client.listArtifacts(sessionId);
     const eventsByRun = Object.fromEntries(terminalEvents);
     const childEventsByRun: Record<string, SessionRunEvent[]> = {};
     for (const [runId, records] of childStreamEvents) {
@@ -2064,8 +2073,9 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
       latestSessionSummaries.current.get(sessionId),
     );
     setSession(refreshedDetail);
+    setResearchPackageImportAllowed(researchPackageImportEligibility.canImport);
     setFiles(workspaceFiles);
-    setArtifacts(projectArtifacts);
+    setArtifacts(sessionArtifacts);
     setPermissionEpoch(epoch);
     setPermissionRequests(permissionRequestItems);
     setPermissionGrants(permissionGrantItems);
@@ -2180,6 +2190,9 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
 
   useEffect(() => {
     const visibleSessionId = activeSessionId;
+    setResearchPackageImportAllowed(false);
+    setFiles([]);
+    setArtifacts([]);
     // The timeline is not reset here: switching Sessions only changes which
     // buffer is rendered, so a run left streaming in the background still has
     // its steps on screen when the user returns to it.
@@ -3104,7 +3117,7 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
         if (activeProjectId) {
           setArtifactSessions(await client.listSessions(activeProjectId, "all"));
           setArtifactSessionCatalogProjectId(activeProjectId);
-          setArtifacts(await client.listProjectArtifacts(activeProjectId));
+          setArtifacts(activeSessionId ? await client.listArtifacts(activeSessionId) : []);
         }
       }
       setDeletionTarget(undefined);
@@ -3144,7 +3157,7 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
     if (!accepted.length) return;
     const result = await client.uploadWorkspaceFiles(activeSessionId, accepted);
     setFiles(result.files);
-    if (activeProjectId) setArtifacts(await client.listProjectArtifacts(activeProjectId));
+    if (activeSessionId) setArtifacts(await client.listArtifacts(activeSessionId));
     for (const item of result.uploaded) {
       if (item.status === "failed") {
         pushToast("error", t("app.uploadFailed"), `${item.originalName}: ${item.error ?? t("app.unknownError")}`);
@@ -4396,6 +4409,10 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
                       label={label}
                       onArchive={() => { setOpenSessionMenuId(undefined); void changeSessionArchiveState("archive", item.id); }}
                       onDelete={() => { setOpenSessionMenuId(undefined); void openDeletion({ id: item.id, kind: "session", label: sessionTitle(item.title) }); }}
+                      onExportConversation={() => { setOpenSessionMenuId(undefined); if (activeProjectId) setResearchPackageDialog({ projectId: activeProjectId, sessionId: item.id, kind: "conversation" }); }}
+                      onExportResearchPackage={() => { setOpenSessionMenuId(undefined); if (activeProjectId) setResearchPackageDialog({ projectId: activeProjectId, sessionId: item.id, kind: "package" }); }}
+                      onImportResearchPackage={() => { setOpenSessionMenuId(undefined); if (activeProjectId) setResearchPackageDialog({ projectId: activeProjectId, sessionId: item.id, kind: "import" }); }}
+                      canImportResearchPackage={item.id === activeSessionId && researchPackageImportAllowed}
                       onRename={() => { setOpenSessionMenuId(undefined); beginInlineRename(target, "sidebar"); }}
                       onRestore={() => { setOpenSessionMenuId(undefined); void changeSessionArchiveState("restore", item.id); }}
                       onSettings={() => { setOpenSessionMenuId(undefined); void openScopedSettings({ id: item.id, kind: "session", label: item.title }); }}
@@ -5326,6 +5343,23 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
         onChangeConfirmation={setDeletionConfirmation}
         onConfirm={() => void confirmDeletion()}
       /> : null}
+      <ResearchPackageDialogs
+        client={client}
+        key={researchPackageDialog ? `${researchPackageDialog.kind}:${researchPackageDialog.sessionId}` : "closed"}
+        onClose={() => setResearchPackageDialog(undefined)}
+        onImported={async (importedSessionIds) => {
+          const projectId = researchPackageDialog?.projectId;
+          if (!projectId) return;
+          const [items, allItems] = await Promise.all([client.listSessions(projectId, sessionListState), client.listSessions(projectId, "all")]);
+          if (activeProjectIdRef.current !== projectId) return;
+          setSessions(items);
+          setArtifactSessions(allItems);
+          setArtifactSessionCatalogProjectId(projectId);
+          const currentSessionId = activeSessionIdRef.current;
+          if (currentSessionId && importedSessionIds.includes(currentSessionId)) await refreshSession(currentSessionId);
+        }}
+        target={researchPackageDialog}
+      />
 
     </div>
     </PluginWebHost></RuntimeConfigClient.Provider>

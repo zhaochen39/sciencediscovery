@@ -39,4 +39,55 @@ export class PluginApiClient extends AuthApiClient {
       }
     } finally { await reader.cancel().catch(() => undefined); reader.releaseLock(); }
   }
+
+  async exportResearchPackage(projectId: string, sessionId?: string, level: "necessary" | "complete" = "necessary", filePaths?: string[]): Promise<Blob> {
+    const params = new URLSearchParams({ level });
+    if (sessionId) params.set("sessionId", sessionId);
+    if (filePaths) { params.set("customFiles", "1"); for (const path of filePaths) params.append("filePath", path); }
+    const query = `?${params.toString()}`;
+    const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/research-package${query}`, {
+      headers: { authorization: `Bearer ${this.token}` },
+    });
+    this.reportAuthStatus(response.status);
+    if (!response.ok) throw new ApiRequestError("Research package export failed", response.status);
+    return response.blob();
+  }
+
+  async exportConversation(sessionId: string, format: "markdown" | "pdf", messageIds?: string[]): Promise<Blob> {
+    const params = new URLSearchParams({ format, ...(messageIds ? { scope: "custom" } : {}) });
+    for (const id of messageIds ?? []) params.append("messageId", id);
+    const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/conversation-export?${params}`, {
+      headers: { authorization: `Bearer ${this.token}` },
+    });
+    this.reportAuthStatus(response.status);
+    if (!response.ok) throw new ApiRequestError("Conversation export failed", response.status);
+    return response.blob();
+  }
+
+  previewResearchPackage(projectId: string, sessionId: string, level: "necessary" | "complete", filePaths?: string[]): Promise<{ estimatedBytes: number; files: Array<{ path: string; size: number }>; omissions: string[] }> {
+    const params = new URLSearchParams({ sessionId, level });
+    if (filePaths) { params.set("customFiles", "1"); for (const path of filePaths) params.append("filePath", path); }
+    return this.request(`/api/projects/${encodeURIComponent(projectId)}/research-package/preview?${params}`);
+  }
+
+  inspectResearchPackage(projectId: string, bytes: Blob): Promise<unknown> {
+    return this.request(`/api/projects/${encodeURIComponent(projectId)}/research-package/inspect`, {
+      method: "POST",
+      body: bytes,
+      headers: { "content-type": "application/octet-stream" },
+    });
+  }
+
+  importResearchPackage(projectId: string, bytes: Blob, sessionId?: string): Promise<unknown> {
+    const query = sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : "";
+    return this.request(`/api/projects/${encodeURIComponent(projectId)}/research-package/import${query}`, {
+      method: "POST",
+      body: bytes,
+      headers: { "content-type": "application/octet-stream" },
+    });
+  }
+
+  canImportResearchPackage(sessionId: string): Promise<{ canImport: boolean }> {
+    return this.request(`/api/sessions/${encodeURIComponent(sessionId)}/research-package-import-eligibility`);
+  }
 }

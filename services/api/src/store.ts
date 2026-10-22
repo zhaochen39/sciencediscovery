@@ -3412,7 +3412,8 @@ export class SessionStore {
   listArtifacts(sessionId: string): ScientificArtifact[] {
     const session = this.getSession(sessionId);
     if (!session) throw new Error("Session not found");
-    return this.listProjectArtifacts(session.projectId);
+    const produced = new Set(this.catalog.artifactVersions.filter((version) => version.sessionId === sessionId).map((version) => version.artifactId));
+    return this.listProjectArtifacts(session.projectId).filter((artifact) => artifact.createdInSessionId === sessionId || produced.has(artifact.id));
   }
 
   /**
@@ -3579,6 +3580,8 @@ export class SessionStore {
     sourcePath?: string;
     title?: string;
     turnId?: string;
+    /** Importers can preserve same-named products as independent Session artifacts. */
+    forceNewArtifact?: boolean;
   }): Promise<{ artifact: ScientificArtifact; version: ScientificArtifactVersion }> {
     this.assertSessionWritable(input.sessionId);
     const session = this.getSession(input.sessionId)!;
@@ -3619,8 +3622,8 @@ export class SessionStore {
       throw new Error("Artifact dependency must reference a version in the same Project");
     }
     const now = new Date().toISOString();
-    let artifact = explicit ?? this.catalog.artifacts.find((candidate) =>
-      candidate.projectId === projectId && candidate.name === logicalName && !candidate.deletedAt);
+    let artifact = explicit ?? (input.forceNewArtifact ? undefined : this.catalog.artifacts.find((candidate) =>
+      candidate.projectId === projectId && candidate.name === logicalName && !candidate.deletedAt));
     if (artifact && artifact.kind !== input.kind) throw new Error("Artifact kind cannot change across versions");
     if (artifact?.origin === "server_generated" && (input.origin ?? "llm_declared") !== "server_generated") {
       throw new Error("Server-generated Artifacts accept new versions only from a server-generated writer");
@@ -3675,6 +3678,18 @@ export class SessionStore {
     if (!this.getSession(sessionId)) throw new Error("Session not found");
     return structuredClone(this.catalog.artifactAnnotations.filter((annotation) => annotation.sessionId === sessionId
       && (!versionId || annotation.artifactVersionId === versionId)));
+  }
+
+  /** Resolve imported lineage after every version has been allocated. */
+  async restoreArtifactVersionLineage(sessionId: string, versionId: string, inputArtifactVersionIds: string[], createdAt: string): Promise<void> {
+    this.assertSessionWritable(sessionId);
+    const projectId = this.getSession(sessionId)!.projectId;
+    const version = this.catalog.artifactVersions.find((item) => item.id === versionId && item.projectId === projectId);
+    if (!version) throw new Error("Artifact version not found");
+    if (inputArtifactVersionIds.some((id) => !this.catalog.artifactVersions.some((item) => item.id === id && item.projectId === projectId))) throw new Error("Imported dependency not found");
+    version.inputArtifactVersionIds = [...new Set([...version.inputArtifactVersionIds, ...inputArtifactVersionIds])];
+    version.createdAt = createdAt;
+    await this.saveCatalog();
   }
 
   async createArtifactAnnotation(
@@ -4963,6 +4978,28 @@ export class SessionStore {
     }
   }
 
+  /** Restore an immutable transcript from a validated research package. */
+  async restoreMessages(sessionId: string, messages: ChatMessage[]): Promise<ChatMessage[]> {
+    const session = this.assertSessionWritable(sessionId);
+    await mkdir(resolve(this.dataDir, "messages"), { recursive: true });
+    const result = await this.mutateArray<ChatMessage, ChatMessage[]>(this.messagesPath(sessionId), (existing) => {
+      const existingIds = new Set(existing.map((message) => message.id));
+      const incomingIds = new Set<string>();
+      for (const message of messages) {
+        if (!message.id || incomingIds.has(message.id)) throw new Error("Research package contains duplicate message ids");
+        incomingIds.add(message.id);
+      }
+      existing.push(...messages.filter((message) => !existingIds.has(message.id)).map((message) => structuredClone(message)));
+      return structuredClone(existing);
+    });
+    const latest = result.toSorted((left, right) => left.createdAt.localeCompare(right.createdAt)).at(-1);
+    if (latest) {
+      session.updatedAt = session.updatedAt > latest.createdAt ? session.updatedAt : latest.createdAt;
+      await this.saveCatalog();
+    }
+    return result;
+  }
+
   async listSessionRuns(sessionId: string): Promise<SessionRun[]> {
     if (!this.getSession(sessionId)) throw new Error("Session not found");
     return (await this.readArray<SessionRun>(this.sessionRunsPath(sessionId)))
@@ -4971,6 +5008,21 @@ export class SessionStore {
 
   async getSessionRun(sessionId: string, runId: string): Promise<SessionRun | undefined> {
     return (await this.listSessionRuns(sessionId)).find((run) => run.id === runId);
+  }
+
+  /** Import historical runs atomically as terminal records, never briefly queue them. */
+  async restoreSessionRun(sessionId: string, imported: SessionRun): Promise<SessionRun> {
+    this.assertSessionWritable(sessionId);
+    if (["queued", "running", "blocked"].includes(imported.status)) {
+      throw new Error("Imported runs must have a terminal status");
+    }
+    return await this.mutateArray<SessionRun, SessionRun>(this.sessionRunsPath(sessionId), (runs) => {
+      const run = { ...structuredClone(imported), sessionId, notificationDelivery: undefined };
+      if (runs.some((item) => item.id === run.id)) throw new Error("Duplicate imported run id");
+      run.queueOrder = runs.reduce((max, item) => Math.max(max, item.queueOrder), 0) + 1;
+      runs.push(run);
+      return structuredClone(run);
+    });
   }
 
   async createSessionRun(input: {
