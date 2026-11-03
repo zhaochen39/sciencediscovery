@@ -2327,3 +2327,30 @@ for (const withMcpReadiness of [false, true]) {
     } finally { await adapter.close(); }
   });
 }
+
+test("a response that starts and never settles ends the run as a stall and says what was last seen", async (t) => {
+  const errors: string[] = [];
+  t.mock.method(console, "error", (message: unknown) => errors.push(String(message)));
+  const text = "the answer Swarm never settled";
+  const adapter = await fakeAdapter(async (_request, response) => {
+    response.writeHead(200, { "content-type": "application/x-ndjson" });
+    response.write(line({ event: { type: "assistant.response.started", responseId: "resp-stuck", turn: 2 } }));
+    response.write(line({ event: { type: "assistant.delta", responseId: "resp-stuck", delta: text } }));
+    // Swarm reports a model answer and then goes quiet: no settle, no tool, no
+    // further event. Nothing else in the run reports this dead state.
+    await new Promise<void>((resolve) => response.on("close", () => resolve()));
+  });
+  try {
+    const agent = createJiuwenSwarmAgentFactory({ adapterUrl: adapter.url, roundStallTimeoutMs: 120 })(options());
+    const events = collect(agent);
+    await assert.rejects(agent.execute("go"), (error: Error) => {
+      assert.match(error.message, /Agent run stalled/);
+      assert.match(error.message, /"lastProgressSource":"agent:message_update"/);
+      assert.match(error.message, new RegExp(`"responseId":"resp-stuck","turn":2,"textChars":${text.length}`));
+      assert.match(error.message, /"toolCalls":0/);
+      return true;
+    });
+    assert.equal(events.filter(event => event.type === "tool_execution_start").length, 0);
+    assert.ok(errors.some(entry => entry.startsWith("[gateway-stall] ") && entry.includes('"event":"round_stalled"')));
+  } finally { await adapter.close(); }
+});

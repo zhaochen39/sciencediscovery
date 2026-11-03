@@ -30,6 +30,7 @@ import { installTestModelCatalog } from "./models-dev.fixture.js";
 
 import {
   classifyModelWireError,
+  describeModelWireError,
   EmptyModelTurnError,
   isModelInputTooLargeError,
   modelEndpointIdentity,
@@ -125,6 +126,44 @@ test("provider context overflow is normalized without treating arbitrary token e
   assert.equal(isModelInputTooLargeError(new Error("network request failed")), false);
 });
 
+test("a wire failure's description keeps the transport code, removes secrets and stays bounded", () => {
+  const error = Object.assign(new Error(`connection lost for super-secret-token ${"x".repeat(600)}`), { code: "UND_ERR_SOCKET" });
+  const detail = describeModelWireError(error, ["super-secret-token"]);
+  assert.equal(detail.code, "UND_ERR_SOCKET");
+  assert.equal(detail.message?.length, 300);
+  assert.doesNotMatch(detail.message!, /super-secret-token/);
+  assert.deepEqual(describeModelWireError("not an error"), {});
+  assert.deepEqual(describeModelWireError(Object.assign(new Error("plain"), { code: "not a code!" })), { message: "plain" });
+  assert.deepEqual(
+    describeModelWireError(new Error("wrapped", { cause: Object.assign(new Error("inner"), { code: "ECONNRESET" }) })),
+    { code: "ECONNRESET", message: "wrapped" },
+    "a socket code carried by the cause still identifies the failure",
+  );
+});
+
+test("a stream cut mid-answer records why it broke, not only that it did", async () => {
+  await withServer(async (request, response) => {
+    await readBody(request);
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.write(`data: ${JSON.stringify({ choices: [{ delta: { content: "partial answer" } }] })}\n\n`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    response.socket?.destroy();
+  }, async (baseUrl) => {
+    const seen: ModelWireDiagnostics[] = [];
+    const failure = await streamModelTurn({ baseUrl, model: "alias-cut", proxy: { mode: "direct" } },
+      "s", [{ role: "user", content: "synthetic" }], [], { ...policy, maxRetries: 0 }, AbortSignal.timeout(5_000),
+      { onWireDiagnostics: (diagnostics) => seen.push(diagnostics) }).then(() => null, (error) => error);
+    assert.ok(failure instanceof Error, "a cut stream is not a completed turn");
+    assert.equal(seen.length, 1, "one summary per request");
+    const record = seen[0]!;
+    assert.equal(record.hasText, true, "the text that did arrive was recorded");
+    assert.equal(record.finishReason, undefined, "no terminal frame ever arrived");
+    assert.ok(record.error, "the record names the failure");
+    assert.ok(record.error!.classification, "the failure is classified");
+    assert.ok(record.error!.message && record.error!.message.length <= 300);
+  });
+});
+
 test("the recorded endpoint identity drops credentials, paths and query strings", () => {
   assert.equal(modelEndpointIdentity({ baseUrl: "https://user:secret@relay.example/v1/chat?api_key=secret-query", model: "alias" }), "https://relay.example");
   assert.equal(modelEndpointIdentity({ apiToken: "secret-token", baseUrl: "http://127.0.0.1:8080/v1", model: "alias" }), "http://127.0.0.1:8080");
@@ -208,7 +247,9 @@ test("model wire diagnostics classify retried attempts and preserve failed-reque
     const diagnostics = modelWireDiagnosticsOf(failure)!;
     assert.equal(diagnostics.httpStatus, 401);
     assert.equal(diagnostics.attempts, 1);
-    assert.deepEqual(diagnostics.error, { classification: "provider_http", httpStatus: 401 });
+    assert.equal(diagnostics.error?.classification, "provider_http");
+    assert.equal(diagnostics.error?.httpStatus, 401);
+    assert.match(diagnostics.error?.message ?? "", /status 401/, "the class alone does not say what the provider said");
     assert.equal(diagnostics.hasText, false);
     assert.ok(!JSON.stringify(diagnostics).includes("super-secret-token"));
   });

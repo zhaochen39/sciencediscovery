@@ -819,7 +819,7 @@ test("an empty terminal turn's summary line carries its empty_completion classif
     const summaries = lines.filter(line => line.startsWith("[model-sse-summary] "))
       .map(line => JSON.parse(line.slice("[model-sse-summary] ".length)));
     assert.equal(summaries.length, 1, "one summary line per request");
-    assert.deepEqual(summaries[0].error, { classification: "empty_completion" });
+    assert.equal(summaries[0].error?.classification, "empty_completion");
     assert.equal(summaries[0].purpose, "task");
     assert.equal(summaries[0].hasText, false);
     assert.equal(summaries[0].hasToolCalls, false);
@@ -844,7 +844,7 @@ test("gateway classifies a custom streamer's reasoning-only empty turn as reason
     const summaries = lines.filter(line => line.startsWith("[model-sse-summary] "))
       .map(line => JSON.parse(line.slice("[model-sse-summary] ".length)));
     assert.equal(summaries.length, 1, "one summary line per request");
-    assert.deepEqual(summaries[0].error, { classification: "reasoning_only" });
+    assert.equal(summaries[0].error?.classification, "reasoning_only");
     assert.equal(summaries[0].hasReasoning, true);
   } finally { await g.close(); }
 });
@@ -908,7 +908,8 @@ test("gateway logs a classified summary when a custom streamer fails without wir
       .map(line => JSON.parse(line.slice("[model-sse-summary] ".length)));
     assert.equal(summaries.length, 1);
     assert.match(summaries[0].gatewayRequestId, /^chatcmpl-/);
-    assert.deepEqual(summaries[0].error, { classification: "provider_http" });
+    assert.equal(summaries[0].error?.classification, "provider_http");
+    assert.match(summaries[0].error?.message ?? "", /status 503/);
   } finally { await g.close(); }
 });
 
@@ -925,7 +926,8 @@ test("a request that fails after the transport reported its wire keeps that evid
     const summaries = lines.filter(line => line.startsWith("[model-sse-summary] "))
       .map(line => JSON.parse(line.slice("[model-sse-summary] ".length)));
     assert.equal(summaries.length, 1, "one summary line per request");
-    assert.deepEqual(summaries[0].error, { classification: "provider_http" });
+    assert.equal(summaries[0].error?.classification, "provider_http");
+    assert.match(summaries[0].error?.message ?? "", /status 503/, "the failure says what went wrong");
     assert.equal(summaries[0].requestId, "model-abc", "the transport's evidence is kept");
     assert.equal(summaries[0].upstreamRequestId, "upstream-9");
     assert.equal(summaries[0].sseRecords, 3);
@@ -973,11 +975,63 @@ for (const shape of ["reasoning-only", "nothing-at-all"] as const) test(`gateway
       .map(line => JSON.parse(line.slice("[model-sse-summary] ".length)));
     assert.equal(summaries.length, 1, "one summary line per request");
     const expectedClass = shape === "reasoning-only" ? "reasoning_only" : "empty_completion";
-    assert.deepEqual(summaries[0].error, { classification: expectedClass },
+    assert.equal(summaries[0].error?.classification, expectedClass,
       "the line names which empty shape the request ended in");
     assert.equal(summaries[0].hasText, false);
     assert.equal(summaries[0].finishReason, "stop");
     assert.equal(summaries[0].hasReasoning, shape === "reasoning-only",
       "a turn that spent its budget thinking is not a relay that sent nothing");
   } finally { await gateway.close(); server.closeAllConnections(); await new Promise<void>(r => server.close(() => r())); }
+});
+
+test("a task stream that breaks off mid-answer is answered as a cut turn so Swarm can recover", async (t) => {
+  const warnings: string[] = [];
+  t.mock.method(console, "warn", (line: string) => warnings.push(String(line)));
+  const interrupted = Object.assign(new Error("other side closed"), { code: "UND_ERR_SOCKET" });
+  const { streamer } = fakeStreamer(interrupted, [["text", "partial answer"]]);
+  const g = await gateway(streamer);
+  try {
+    const response = await post(g, { messages: [{ role: "user", content: "go" }], stream: true });
+    assert.equal(response.status, 200);
+    const text = await response.text();
+    assert.match(text, /partial answer/);
+    assert.match(text, /\[output_limit:tool_calls_withheld\]/,
+      "the boundary reads the same marker a cut turn carries");
+    const frames = text.split("\n\n").filter((part) => part.startsWith("data: "));
+    assert.ok(frames.some((frame) => frame.includes('"finish_reason":"length"')), "the turn is cut, not failed");
+    assert.equal(frames.at(-1), "data: [DONE]");
+    assert.doesNotMatch(text, /model_gateway_error/, "a retryable cut is not reported as a transport failure");
+    const failure = g.lastWireFailure();
+    assert.equal(failure?.classification, "network");
+    assert.equal(failure?.code, "UND_ERR_SOCKET");
+    assert.match(failure?.message ?? "", /other side closed/);
+    assert.ok(warnings.some((line) => line.startsWith("[output-recovery] ")
+      && line.includes('"event":"model.stream_interrupted"')));
+  } finally { await g.close(); }
+});
+
+test("a stream that breaks off after Swarm spent its recovery budget fails as a transport error", async () => {
+  const interrupted = Object.assign(new Error("other side closed"), { code: "UND_ERR_SOCKET" });
+  const { streamer } = fakeStreamer(interrupted, [["text", "partial answer"]]);
+  const g = await gateway(streamer);
+  try {
+    const response = await post(g, { messages: [
+      { role: "user", content: "go" },
+      { role: "user", content: "[Output limit recovery 2/2; the previous response was withheld]" },
+    ], stream: true });
+    const text = await response.text();
+    assert.match(text, /model_gateway_error/);
+    assert.doesNotMatch(text, /tool_calls_withheld/,
+      "answering a third cut as recoverable would loop past the boundary's budget");
+  } finally { await g.close(); }
+});
+
+test("a provider refusal before any byte is sent is not answered as a recoverable cut", async (t) => {
+  const { streamer } = fakeStreamer(new ModelRequestError("Model request failed with status 401", 401));
+  const g = await gateway(streamer);
+  try {
+    const response = await post(g, { messages: [{ role: "user", content: "go" }], stream: true });
+    assert.equal(response.status, 401);
+    assert.doesNotMatch(await response.text(), /tool_calls_withheld/);
+  } finally { await g.close(); }
 });

@@ -22,6 +22,7 @@ import {
   ModelRequestError,
   EmptyModelTurnError,
   classifyModelWireError,
+  describeModelWireError,
   isEmptyTerminalTurn,
   modelEndpointIdentity,
   streamModelTurn,
@@ -56,9 +57,16 @@ export interface ModelGateway {
    */
   restore<T extends Record<string, unknown>>(message: T): T;
   /** The last model turn served, for what the run's end has to say about it. */
-  lastTurn(): { text: string; toolCalls: number; truncated: boolean; recoveryAttempts?: number } | undefined;
+  lastTurn(): { text: string; toolCalls: number; toolNames?: string[]; truncated: boolean; recoveryAttempts?: number } | undefined;
   /** The last task turn whose tool calls were withheld because their arguments could not be used. */
   lastFailure(): { requestId: string; tools: string[]; recoveryAttempts?: number } | undefined;
+  /**
+   * The last task model request that failed on the wire, with its bounded cause. A run that ends
+   * without a word from the model otherwise reads as an agent defect; this says whether the
+   * transport, the provider or the assembly broke. Never carries prompts, arguments or credentials.
+   */
+  lastWireFailure(): { requestId: string; classification: ModelWireErrorClass; httpStatus?: number;
+    code?: string; message?: string } | undefined;
   /** Payload-free metadata for active requests; never includes prompts or arguments. */
   diagnostics(): Array<{ id: string; purpose: "task" | "auxiliary"; phase: string; elapsedMs: number;
     upstreamChunks: number; downstreamChunks: number; upstreamIdleMs: number; downstreamIdleMs: number }>;
@@ -234,11 +242,13 @@ export async function startModelGateway(
   const produced = new Map<string, Record<string, unknown>>();
   let last: ReturnType<ModelGateway["lastTurn"]>;
   let lastFailure: ReturnType<ModelGateway["lastFailure"]>;
+  let lastWireFailure: ReturnType<ModelGateway["lastWireFailure"]>;
   const active = new Map<string, () => ReturnType<ModelGateway["diagnostics"]>[number]>();
   const remember = (turn: ModelTurn, body: ChatRequest) => {
     produced.set(turnKey(turn.assistantMessage), turn.assistantMessage);
     const recovery = recoveryAttemptOf(body);
     last = { text: textOf(turn.assistantMessage.content), toolCalls: turn.toolCalls.length,
+      ...(turn.toolCalls.length ? { toolNames: turn.toolCalls.slice(0, 20).map(call => call.name) } : {}),
       truncated: turn.truncated === true, ...(recovery ? { recoveryAttempts: recovery } : {}) };
     if (turn.truncated) console.warn(`[output-recovery] ${JSON.stringify({ event: "model.output_limit",
       kind: turn.toolCalls.length ? "tool_arguments" : last.text.trim() ? "partial_answer" : "reasoning_only",
@@ -300,7 +310,7 @@ export async function startModelGateway(
     if (signal.aborted) abort();
     response.on("close", () => { if (!response.writableEnded) controller.abort(); });
     const id = `chatcmpl-${randomUUID()}`;
-    if (!auxiliary) lastFailure = undefined;
+    if (!auxiliary) { lastFailure = undefined; lastWireFailure = undefined; }
     // One line per model request into the API log (and so the real-E2E
     // stack.log evidence). It is counts, timings and classifications only:
     // never prompts, answers, tool arguments, headers or credentials.
@@ -312,18 +322,21 @@ export async function startModelGateway(
     // record is held until the outcome is known, so the one line a request writes
     // carries the classification of the error it ended with.
     const logWire = (wire: ModelWireDiagnostics) => { pendingWire = wire; };
-    const reportWire = (errorClass?: ModelWireErrorClass) => {
+    const reportWire = (errorClass?: ModelWireErrorClass, error?: unknown) => {
       if (wireReported) return;
       const classification = pendingWire?.error?.classification ?? errorClass;
       if (!pendingWire && classification === undefined) return;
       wireReported = true;
+      const failure = pendingWire?.error ?? (classification === undefined ? undefined
+        : { classification, ...(error === undefined ? {} : describeModelWireError(error, [endpoint.apiToken ?? ""])) });
+      if (failure && !auxiliary) lastWireFailure = { requestId: id, ...failure };
       const record = {
         ...(pendingWire ?? { endpoint: modelEndpointIdentity(endpoint), model: endpoint.model }),
         gatewayRequestId: id,
         purpose,
         // The transport's own classified record already carries its status;
         // a local rejection only adds the class to the record it reported.
-        ...(classification === undefined ? {} : { error: pendingWire?.error ?? { classification } }),
+        ...(failure === undefined ? {} : { error: failure }),
       };
       try { console.info(`[model-sse-summary] ${JSON.stringify(record)}`); } catch { /* logging must not change the request */ }
     };
@@ -374,6 +387,11 @@ export async function startModelGateway(
     // treats this one the same; the marker tells the recovery which feedback to give.
     const withheldNotice = (turn: ModelTurn, invalid: readonly WithheldCall[]) =>
       `${textOf(turn.assistantMessage.content) ? "\n\n" : ""}${invalidNotice(invalid)}`;
+    // Whether the failure came from the model stream itself rather than from
+    // what the gateway made of a completed turn (an empty turn, invalid calls).
+    // Only the former is recovered: a broken transport is what Swarm's recovery
+    // boundary can answer by asking the model again.
+    let modelStreamFailed = false;
     const streamStarted = Date.now();
     let upstreamChunks = 0, downstreamChunks = 0, toolArgumentChars = 0;
     let lastUpstreamAt = streamStarted, lastDownstreamAt = streamStarted, lastLogAt = 0;
@@ -452,7 +470,7 @@ export async function startModelGateway(
           // the run, so the transport classifies its one record accordingly.
           rejectEmptyTerminalTurn: !auxiliary,
           onWireDiagnostics: logWire,
-        });
+        }).catch((error: unknown) => { modelStreamFailed = true; throw error; });
         controller.signal.throwIfAborted();
         await recordInvalidArguments(turn, id);
         const invalid = invalidCalls(turn);
@@ -501,11 +519,30 @@ export async function startModelGateway(
     } catch (error) {
       // The request ends here, so the one line it writes names this class even
       // when the transport already reported the wire on its success path.
-      reportWire(classifyModelWireError(error));
+      const classification = classifyModelWireError(error);
+      reportWire(classification, error);
       trace(controller.signal.aborted ? "cancelled" : "error", true);
       const status = error instanceof ModelRequestError && error.statusCode >= 400 && error.statusCode < 600 ? error.statusCode : 502;
       const original = error instanceof Error ? error.message : String(error);
       const message = endpoint.apiToken ? original.split(endpoint.apiToken).join("[redacted]") : original;
+      // A task stream that breaks off mid-answer is answered as a cut turn, so
+      // Swarm's output-recovery boundary asks the model again instead of the
+      // interaction round failing on a transport error it cannot retry itself.
+      // A provider refusing the request, an exhausted recovery budget and a
+      // cancelled or auxiliary request fail as before.
+      const recoverInterrupted = modelStreamFailed && !auxiliary && !controller.signal.aborted
+        && response.headersSent && (recoveryAttemptOf(body) ?? 0) < MAX_RECOVERY_ATTEMPTS
+        && classification !== "provider_http" && classification !== "aborted";
+      if (recoverInterrupted) {
+        console.warn(`[output-recovery] ${JSON.stringify({ event: "model.stream_interrupted",
+          gatewayRequestId: id, classification, recoveryAttempts: recoveryAttemptOf(body) ?? 0,
+          upstreamChunks, downstreamChunks, elapsedMs: Date.now() - streamStarted })}`);
+        // Same notice a cut response carries, so the boundary treats this the same.
+        response.write(chunk({ content: downstreamChunks ? `\n\n${WITHHELD_TOOLS}` : WITHHELD_TOOLS }));
+        response.write(chunk({}, "length"));
+        response.end("data: [DONE]\n\n");
+        return;
+      }
       if (response.headersSent) {
         // Mid-stream: tell the client the way OpenAI does, then stop.
         response.write(`data: ${JSON.stringify({ error: { message, type: "model_gateway_error" } })}\n\n`);
@@ -526,6 +563,7 @@ export async function startModelGateway(
     restore,
     lastTurn: () => last,
     lastFailure: () => lastFailure,
+    lastWireFailure: () => lastWireFailure,
     diagnostics: () => [...active.values()].map(snapshot => snapshot()),
     close: () => new Promise<void>((resolve) => { server.close(() => resolve()); server.closeAllConnections(); }),
   };

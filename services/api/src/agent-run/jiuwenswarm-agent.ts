@@ -13,7 +13,7 @@
 // limitations under the License.
 
 import { randomUUID } from "node:crypto";
-import { createServer, type IncomingMessage, type Server } from "node:http";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 
 import type { AgentEvent } from "@sciencediscovery/orchestration";
@@ -59,6 +59,14 @@ export interface JiuwenSwarmAgentConfig {
   adapterToken?: string;
   /** How long the bridge waits for the adapter to report a tool call before running it anyway. */
   toolAnnouncementTimeoutMs?: number;
+  /**
+   * How long a run may go with no model request, no running tool and no adapter
+   * event before it is declared stalled (default 180 s). Swarm can stop between
+   * a model answer and the tool it asked for without reporting anything; the
+   * idle deadline would eventually end the run, but only the run's whole budget
+   * later and without saying what the last answer was. Replaceable for tests.
+   */
+  roundStallTimeoutMs?: number;
   /** Replaceable for tests. */
   fetch?: typeof fetch;
   /** Replaceable for tests: the native model client the run's model requests are served by. */
@@ -105,6 +113,11 @@ export interface JiuwenSwarmAgentConfig {
    */
   subagents?: "jiuwenswarm" | "task";
 }
+
+const DEFAULT_ROUND_STALL_TIMEOUT_MS = 180_000;
+/** A response that started but neither settled nor produced a tool call by then is reported. */
+const UNSETTLED_RESPONSE_WARN_MS = 60_000;
+const ROUND_WATCHDOG_INTERVAL_MS = 15_000;
 
 /**
  * What the model is told about JiuwenSwarm's todo tools. The rest of the system prompt says to use only the
@@ -255,6 +268,14 @@ class JiuwenSwarmAgent implements NativeAgentHandle {
   private lastProgressSource = "setup";
   /** Waits begun before the deadlines exist (an approval asked while the run is set up). */
   private pendingWaits = 0;
+  /** Approvals and other waits outside the run that pause its deadlines. */
+  private externalWaits = 0;
+  /** Tool calls reported as started and not yet ended, bridged or native. */
+  private readonly openToolCalls = new Set<string>();
+  /** The adapter's last started response that has not settled, with its progress. */
+  private pendingResponse?: { responseId: string; turn: number; startedAt: number; textChars: number; toolCalls: number; warned: boolean };
+  /** What the run was doing when the stall watchdog ended it, for the failure it throws. */
+  private stallDetail?: Record<string, unknown>;
 
   constructor(private readonly config: JiuwenSwarmAgentConfig, private readonly options: NativeAgentOptions) {}
 
@@ -269,13 +290,19 @@ class JiuwenSwarmAgent implements NativeAgentHandle {
 
   /** The run waits on something outside it (an approval): its deadlines stand still meanwhile. */
   beginExternalWait(): () => void {
-    if (this.deadlines) return this.deadlines.beginWait();
-    this.pendingWaits += 1;
+    this.externalWaits += 1;
+    let release: () => void;
+    if (this.deadlines) release = this.deadlines.beginWait();
+    else {
+      this.pendingWaits += 1;
+      release = () => { this.pendingWaits = Math.max(0, this.pendingWaits - 1); };
+    }
     let released = false;
     return () => {
       if (released) return;
       released = true;
-      this.pendingWaits = Math.max(0, this.pendingWaits - 1);
+      this.externalWaits = Math.max(0, this.externalWaits - 1);
+      release();
     };
   }
 
@@ -284,6 +311,7 @@ class JiuwenSwarmAgent implements NativeAgentHandle {
   }
 
   private emit(event: AgentEvent): void {
+    this.observeRunState(event);
     this.markProgress(`agent:${event.type}`);
     const evidence = this.trajectory?.evidence(event as { type: string; responseId?: unknown; turn?: unknown });
     const tagged = evidence ? { ...event, evidence } as AgentEvent : event;
@@ -300,6 +328,72 @@ class JiuwenSwarmAgent implements NativeAgentHandle {
     console.info(`[gateway-progress] ${JSON.stringify({ phase, sessionId: this.options.sessionId,
       agentId: this.options.versioning?.agentId, idleMs: Date.now() - this.lastProgressAt,
       lastProgressSource: this.lastProgressSource, activeModelRequests: gateway.diagnostics() })}`);
+  }
+
+  /** Keeps the stall watchdog's view of what the run is waiting on. */
+  private observeRunState(event: AgentEvent): void {
+    switch (event.type) {
+      case "response_start": {
+        const start = event as { responseId?: unknown; turn?: unknown };
+        this.pendingResponse = { responseId: String(start.responseId), turn: Number(start.turn),
+          startedAt: Date.now(), textChars: 0, toolCalls: 0, warned: false };
+        break;
+      }
+      case "message_update": {
+        const delta = (event as { assistantMessageEvent?: { delta?: unknown } }).assistantMessageEvent?.delta;
+        if (this.pendingResponse && typeof delta === "string") this.pendingResponse.textChars += delta.length;
+        break;
+      }
+      case "tool_execution_start": {
+        const id = (event as { toolCallId?: unknown }).toolCallId;
+        if (typeof id === "string") this.openToolCalls.add(id);
+        if (this.pendingResponse) this.pendingResponse.toolCalls += 1;
+        break;
+      }
+      case "tool_execution_end": {
+        const id = (event as { toolCallId?: unknown }).toolCallId;
+        if (typeof id === "string") this.openToolCalls.delete(id);
+        break;
+      }
+      case "response_settled":
+        if (this.pendingResponse?.responseId === String((event as { responseId?: unknown }).responseId)) this.pendingResponse = undefined;
+        break;
+      default:
+        break;
+    }
+  }
+
+  /**
+   * Ends a run that stopped between a model answer and the tool it asked for.
+   * Nothing in the adapter reports that dead state: no request is in flight, no
+   * tool is running, and no event is coming, so the idle deadline would only end
+   * the run a whole budget later without saying what the last answer was.
+   */
+  private checkRoundProgress(gateway: ModelGateway, bridge: { busy(): number }, stallTimeoutMs: number): void {
+    const requests = gateway.diagnostics();
+    const pending = this.pendingResponse;
+    const openTools = bridge.busy() + this.openToolCalls.size;
+    if (pending && !pending.warned && Date.now() - pending.startedAt >= UNSETTLED_RESPONSE_WARN_MS) {
+      pending.warned = true;
+      console.warn(`[gateway-stall] ${JSON.stringify({ event: "response_unsettled", responseId: pending.responseId,
+        turn: pending.turn, textChars: pending.textChars, toolCalls: pending.toolCalls,
+        ageMs: Date.now() - pending.startedAt, lastProgressSource: this.lastProgressSource,
+        activeModelRequests: requests.length, openTools })}`);
+    }
+    const idleMs = Date.now() - this.lastProgressAt;
+    if (requests.length || openTools || this.externalWaits || idleMs < stallTimeoutMs) return;
+    const turn = gateway.lastTurn();
+    const wireFailure = gateway.lastWireFailure();
+    const detail = { idleMs, lastProgressSource: this.lastProgressSource,
+      ...(turn === undefined ? {} : { lastModelTurn: { toolCalls: turn.toolCalls, toolNames: turn.toolNames ?? [],
+        textChars: turn.text.length, truncated: turn.truncated,
+        ...(turn.recoveryAttempts === undefined ? {} : { recoveryAttempts: turn.recoveryAttempts }) } }),
+      ...(wireFailure === undefined ? {} : { lastWireFailure: wireFailure }),
+      ...(pending === undefined ? {} : { response: { responseId: pending.responseId, turn: pending.turn,
+        textChars: pending.textChars, toolCalls: pending.toolCalls, ageMs: Date.now() - pending.startedAt } }) };
+    this.stallDetail = detail;
+    console.error(`[gateway-stall] ${JSON.stringify({ event: "round_stalled", ...detail })}`);
+    this.controller.abort();
   }
 
   async execute(text: string): Promise<{ finalMessages: Awaited<ReturnType<NativeAgentHandle["execute"]>>["finalMessages"] }> {
@@ -410,6 +504,10 @@ class JiuwenSwarmAgent implements NativeAgentHandle {
     const progressTimer = process.env.SCIENCE_AGENT_TRACE_GATEWAY_PROGRESS === "1"
       ? setInterval(() => this.logGatewayProgress("heartbeat", modelGateway), 30_000) : undefined;
     progressTimer?.unref();
+    const stallTimeoutMs = this.config.roundStallTimeoutMs ?? DEFAULT_ROUND_STALL_TIMEOUT_MS;
+    const watchdog = setInterval(() => this.checkRoundProgress(modelGateway, bridge, stallTimeoutMs),
+      Math.min(ROUND_WATCHDOG_INTERVAL_MS, Math.max(10, Math.floor(stallTimeoutMs / 4))));
+    watchdog.unref();
     try {
       const finalText = await this.stream(text, tools, bridge.url, bridgeToken, announcements, transcript, modelGateway, jiuwenSwarmPlans, jiuwenSwarmSubagents, hiddenWebTools);
       this.controller.signal.throwIfAborted();
@@ -427,6 +525,10 @@ class JiuwenSwarmAgent implements NativeAgentHandle {
       // Keep "timeout" in these errors: classifySubagentFailure matches /timeout/i for a sub-agent's timed_out status.
       if (deadlines.expired) throw deadlines.error();
       if (this.approvalDeliveryError) throw this.approvalDeliveryError;
+      if (this.stallDetail) throw new Error(
+        `Agent run stalled: no model request, no running tool and no adapter event for ${String(this.stallDetail.idleMs)} ms; ${JSON.stringify(this.stallDetail)}`,
+        { cause: error },
+      );
       if (this.controller.signal.aborted) throw new Error("Agent run cancelled");
       const modelFailure = modelGateway.lastFailure();
       if (modelFailure) throw new Error(
@@ -448,9 +550,21 @@ class JiuwenSwarmAgent implements NativeAgentHandle {
         const cause = error.cause as { name?: string; code?: string; message?: string } | undefined;
         console.warn(`[jiuwenswarm-agent] transport diagnostic: ${JSON.stringify({ name: error.name, stack: error.stack, cause: cause && { name: cause.name, code: cause.code, message: cause.message } })}`);
       }
+      // The run's own error (Swarm's round failure) says nothing about the model.
+      // When the last task request died on the wire, that is the cause the reader
+      // needs; the gateway resets this at every new task request, so it is never
+      // a stale failure the run already recovered from.
+      const wireFailure = modelGateway.lastWireFailure();
+      if (wireFailure) {
+        console.warn(`[jiuwenswarm-agent] last model request failed on the wire: ${JSON.stringify(wireFailure)}`);
+        throw new Error(`${error instanceof Error ? error.message : String(error)} (model request ${wireFailure.requestId} failed: ${
+          [wireFailure.classification, wireFailure.code, wireFailure.message].filter(Boolean).join(" ")})`,
+        { cause: error });
+      }
       throw error;
     } finally {
       if (progressTimer) clearInterval(progressTimer);
+      clearInterval(watchdog);
       deadlines.stop();
       await bridge.close();
       await modelGateway.close();
@@ -1057,9 +1171,11 @@ async function startBridge(
   announcements: ToolAnnouncements,
   transcript: Transcript,
   announcementTimeoutMs?: number,
-): Promise<{ url: string; close(): Promise<void> }> {
+): Promise<{ url: string; busy(): number; close(): Promise<void> }> {
   const scheduler = new ToolScheduler(registry, announcements, announcementTimeoutMs);
-  const server: Server = createServer(async (request, response) => {
+  /** Bridge calls being served: queued, running or answering. The watchdog must not call that a stall. */
+  let inFlight = 0;
+  const handle = async (request: IncomingMessage, response: ServerResponse) => {
     const reply = (status: number, body: unknown) => {
       response.writeHead(status, { "content-type": "application/json" });
       response.end(JSON.stringify(body));
@@ -1140,11 +1256,16 @@ async function startBridge(
     }
     reply(200, { text: dispatched.content, isError });
     if (process.env.SCIENCE_AGENT_JIUWENSWARM_DEBUG === "1") console.warn(`[jiuwenswarm-bridge] answered ${tool.name} (${toolCallId})`);
+  };
+  const server: Server = createServer((request, response) => {
+    inFlight += 1;
+    void handle(request, response).finally(() => { inFlight -= 1; });
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const { port } = server.address() as AddressInfo;
   return {
     url: `http://127.0.0.1:${port}/bridge`,
+    busy: () => inFlight,
     close: () => new Promise<void>((resolve) => {
       server.close(() => resolve());
       server.closeAllConnections();

@@ -157,7 +157,32 @@ export interface ModelWireDiagnostics {
   truncated: boolean;
   /** Classification of each attempt that was retried before the final one. */
   retryErrors: ModelWireErrorClass[];
-  error?: { classification: ModelWireErrorClass; httpStatus?: number };
+  /**
+   * What ended the request. `code` is the transport's own error token (an
+   * undici code, a socket code) and `message` a bounded, redacted description:
+   * a class alone cannot tell a relay dropping the connection from a provider
+   * refusing to finish an answer, and the two need different fixes.
+   */
+  error?: { classification: ModelWireErrorClass; httpStatus?: number; code?: string; message?: string };
+}
+
+/** A transport error's own token, for telling two errors of one class apart. */
+const WIRE_ERROR_CODE = /^[A-Za-z0-9_.:-]{1,64}$/;
+
+/**
+ * The bounded, redacted description of a failed model request: the transport's
+ * error code and the head of its message. Never carries prompts, tool arguments,
+ * headers or credentials; the caller's secrets are removed before bounding.
+ */
+export function describeModelWireError(error: unknown, secrets: readonly string[] = []): { code?: string; message?: string } {
+  if (typeof error !== "object" || error === null) return {};
+  const record = error as { code?: unknown; message?: unknown; cause?: { code?: unknown } | null };
+  const codeOf = (value: unknown) => typeof value === "string" && WIRE_ERROR_CODE.test(value) ? value : undefined;
+  const code = codeOf(record.code) ?? codeOf(record.cause?.code);
+  let message = error instanceof Error ? error.message : typeof record.message === "string" ? record.message : "";
+  for (const secret of secrets) if (secret) message = message.split(secret).join("[redacted]");
+  message = message.replace(/\s+/g, " ").trim().slice(0, 300);
+  return { ...(code ? { code } : {}), ...(message ? { message } : {}) };
 }
 
 /** A completed assistant turn with no visible answer and no tool call. */
@@ -398,12 +423,15 @@ class ModelWireRecorder {
   private finish?: string;
   private truncated = false;
 
+  private readonly secrets: string[];
+
   constructor(
     endpoint: ModelEndpoint,
     private readonly protocol: ModelApiProtocol,
   ) {
     this.endpoint = modelEndpointIdentity(endpoint);
     this.model = endpoint.model.slice(0, 200);
+    this.secrets = endpoint.apiToken ? [endpoint.apiToken] : [];
   }
 
   dispatch(): void {
@@ -454,7 +482,7 @@ class ModelWireRecorder {
   /** Whether the provider streamed reasoning text for this request. */
   reasoningObserved(): boolean { return this.reasoningSeen; }
 
-  report(errorClass?: ModelWireErrorClass): ModelWireDiagnostics {
+  report(errorClass?: ModelWireErrorClass, error?: unknown): ModelWireDiagnostics {
     const completedMs = Date.now();
     const dispatched = this.dispatchedMs ?? this.startedMs;
     const iso = (ms: number) => new Date(ms).toISOString();
@@ -488,7 +516,9 @@ class ModelWireRecorder {
       truncated: this.truncated,
       retryErrors: [...this.retryErrors],
       ...(errorClass === undefined ? {} : {
-        error: { classification: errorClass, ...(errorClass === "provider_http" && this.httpStatus !== undefined ? { httpStatus: this.httpStatus } : {}) },
+        error: { classification: errorClass,
+          ...(errorClass === "provider_http" && this.httpStatus !== undefined ? { httpStatus: this.httpStatus } : {}),
+          ...(error === undefined ? {} : describeModelWireError(error, this.secrets)) },
       }),
     };
   }
@@ -542,7 +572,10 @@ async function requestWithRetry(options: RequestOptions, recorder: ModelWireReco
         headers: options.headers,
         body: options.body,
         signal: options.signal,
-        bodyTimeout: 0,
+        // A provider that stops sending mid-stream must fail as a timeout here,
+        // where it is named, instead of leaving the run waiting on a socket that
+        // will never speak again. Retries cannot reach it: the stream had started.
+        bodyTimeout: options.policy.requestTimeoutMs,
         headersTimeout: options.policy.requestTimeoutMs,
         ...(dispatcher ? { dispatcher } : {}),
       });
@@ -1386,8 +1419,8 @@ export async function streamModelTurn(
     onThinkingDelta: (delta) => { recorder.reasoning(delta); callbacks.onThinkingDelta?.(delta); },
     onToolCallDelta: (delta) => { recorder.tool(delta); callbacks.onToolCallDelta?.(delta); },
   };
-  const emit = (errorClass?: ModelWireErrorClass): ModelWireDiagnostics => {
-    const diagnostics = recorder.report(errorClass);
+  const emit = (errorClass?: ModelWireErrorClass, error?: unknown): ModelWireDiagnostics => {
+    const diagnostics = recorder.report(errorClass, error);
     try { callbacks.onWireDiagnostics?.(diagnostics); } catch { /* diagnostics never change a model request */ }
     return diagnostics;
   };
@@ -1405,7 +1438,7 @@ export async function streamModelTurn(
         break;
     }
   } catch (error) {
-    const diagnostics = emit(classifyModelWireError(error));
+    const diagnostics = emit(classifyModelWireError(error), error);
     if (typeof error === "object" && error !== null) wireDiagnosticsByError.set(error, diagnostics);
     throw error;
   }
