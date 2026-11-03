@@ -119,6 +119,8 @@ jobs:
       SCIENCE_AGENT_INVALID_TOOL_ARGUMENTS_FILE: ${{ github.workspace }}/.ci-results/model-invalid-arguments.jsonl
       CI_RUNTIME_DIR: ${{ github.workspace }}/.ci-runtime/real-e2e
       CI_BIOMNI_CASE_ID: ${{ matrix.biomni_case }}
+      # Allow long research turns to go up to fifteen minutes without progress.
+      SCIENCE_AGENT_GATEWAY_IDLE_TIMEOUT_MS: '900000'
       # Biomni inputs exceed the product's 10 GiB default workspace quota.
       # Forty GiB covers the largest pinned input plus the required output reserve.
       SCIENCE_AGENT_MAX_WORKSPACE_BYTES: ${{ matrix.biomni_case != '' && '42949672960' || '' }}
