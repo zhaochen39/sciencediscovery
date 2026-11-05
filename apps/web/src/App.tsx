@@ -3258,7 +3258,9 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
         await client.deleteProject(deletionTarget.id);
         const remaining = projects.filter((project) => project.id !== deletionTarget.id);
         setProjects(remaining);
-        setActiveProjectId(selectAfterRemoval(projects, deletionTarget.id, activeProjectId));
+        const nextProjectId = selectAfterRemoval(projects, deletionTarget.id, activeProjectId);
+        if (nextProjectId !== activeProjectId) setActiveSessionId(undefined);
+        setActiveProjectId(nextProjectId);
       } else {
         await client.deleteSession(deletionTarget.id);
         latestSessionSummaries.current.delete(deletionTarget.id);
@@ -4612,6 +4614,11 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
                     className={project.id === activeProjectId ? "nav-item active" : "nav-item"}
                     onClick={() => {
                       setOpenSubagentId(undefined);
+                      // The selected Session belongs to the Project being left,
+                      // so drop it before the new Project's list resolves:
+                      // scope-aware consumers would otherwise pair the new
+                      // Project with the old Session and be rejected.
+                      if (project.id !== activeProjectId) setActiveSessionId(undefined);
                       setActiveProjectId(project.id);
                       setSidebarDrawerOpen(false);
                       setOpenProjectMenuId(undefined);

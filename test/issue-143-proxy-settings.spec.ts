@@ -14,22 +14,30 @@
 
 import { randomUUID } from "node:crypto";
 
-import { expect, test, type Locator, type Page } from "@playwright/test";
+import { expect, type Locator, type Page } from "@playwright/test";
+
+import { test } from "./helpers/e2e.ts";
 
 // Static suite metadata is inherited by each framework-expanded journey.
-test.describe("issue-143-proxy-settings.spec", { tag: ["@category:e2e", "@os:linux", "@arch:amd64", "@status:legacy", "@sandbox:bubblewrap"] }, () => {
+test.describe("issue-143-proxy-settings.spec", { tag: ["@isolation:global", "@category:e2e", "@os:linux", "@arch:amd64", "@status:reviewed", "@sandbox:bubblewrap"] }, () => {
 
 const screenshotDirectory = process.env.E2E_SCREENSHOT_DIR ?? "screenshots";
 
 async function openProxySettings(page: Page) {
   await page.goto("/");
-  await page.waitForLoadState("networkidle");
+  await expect(page.locator(".app-shell")).toBeVisible();
   // Below the 1024px breakpoint the sidebar is an off-canvas drawer: open it
   // before reaching for its entries.
   const drawerToggle = page.getByRole("button", { name: "Open navigation" });
   if (await drawerToggle.isVisible()) await drawerToggle.click();
   await page.getByRole("button", { name: "System configuration" }).click();
   const configuration = page.getByRole("dialog", { name: "System configuration" });
+  // The settings directory folds behind its toggle at the same breakpoint, so
+  // open it before reaching for a group entry.
+  const settingsNavigation = configuration.getByRole("navigation", { name: "Setting groups" });
+  if (!(await settingsNavigation.isVisible())) {
+    await configuration.getByRole("button", { name: /^Settings directory/ }).click();
+  }
   await configuration.getByRole("button", { name: "Network proxies" }).click();
   await expect(configuration.getByRole("heading", { name: "Network proxies" })).toBeVisible();
   return configuration;
@@ -66,7 +74,26 @@ async function expectOverlayWithinDialogAndViewport(page: Page, dialog: Locator,
   expect(overlayBox.y + overlayBox.height).toBeLessThanOrEqual(Math.min(viewport.height, dialogBox.y + dialogBox.height) + 1);
 }
 
-test("proxy settings put defaults and registry first and expose one WebSearch policy", async ({ page }) => {
+/**
+ * E2E-META
+ * Purpose: 代理设置把默认代理与注册表放在最前，URL 格式帮助稳定可操作，且 WebSearch 代理策略只有一处入口。
+ * Steps:
+ *   1. 在系统设置中打开 Network proxies。
+ *   2. 断言 Default proxy 位于 Proxy server list 之前，旧式 URL 指南入口不存在。
+ *   3. 打开添加表单，展开 URL 格式帮助，断言内容、表单几何稳定与浮层边界。
+ *   4. 断言帮助可悬停、聚焦、Escape 与点击切换，并在 environment/system 类型下隐藏。
+ *   5. 断言 WebSearch proxy 只在此页出现，Web providers 页只给出指向说明。
+ * Environment: 隔离本地栈，浏览器 egress 仅限 127.0.0.1。
+ * Type: mocked
+ * LLM: none
+ * WebSearch: none
+ * PaperSources: none
+ * MCP: none
+ * OtherExternal: none — 只读本地设置页，不发起真实代理连接。
+ * Credentials: 隔离实例的 E2E_API_TOKEN。
+ * CostSideEffects: none — 用例只打开表单后取消。
+ */
+test("proxy settings put defaults and registry first and expose one WebSearch policy", { tag: "@mocked" }, async ({ page }) => {
   const configuration = await openProxySettings(page);
   const defaultHeading = configuration.getByRole("heading", { name: "Default proxy" });
   const serversHeading = configuration.getByRole("heading", { name: "Proxy server list" });
@@ -144,32 +171,25 @@ test("proxy settings put defaults and registry first and expose one WebSearch po
   await expect(configuration.getByLabel("Web proxy")).toHaveCount(0);
 });
 
-test("proxy settings remain usable at a narrow viewport", async ({ page }) => {
-  await page.setViewportSize({ width: 390, height: 844 });
-  const configuration = await openProxySettings(page);
-  await expect(configuration.getByRole("heading", { name: "Default proxy" })).toBeVisible();
-  await expect(configuration.getByRole("heading", { name: "Proxy server list" })).toBeVisible();
-  await configuration.getByRole("button", { name: "Add proxy server" }).click();
-  const form = configuration.getByRole("form", { name: "Add proxy server" });
-  await form.getByRole("button", { name: "Show proxy URL format help" }).scrollIntoViewIfNeeded();
-  const closedGeometry = await captureFormGeometry(form);
-  await form.getByRole("button", { name: "Show proxy URL format help" }).click();
-  const guide = form.getByRole("tooltip");
-  await expect(guide).toBeVisible();
-  expectStableGeometry(closedGeometry, await captureFormGeometry(form));
-  await expectOverlayWithinDialogAndViewport(page, configuration, guide);
-  const hasHorizontalOverflow = await configuration.evaluate((element) => element.scrollWidth > element.clientWidth + 1);
-  expect(hasHorizontalOverflow).toBe(false);
-  const hasPageHorizontalOverflow = await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth + 1);
-  expect(hasPageHorizontalOverflow).toBe(false);
-  await page.screenshot({
-    path: `${screenshotDirectory}/issue-143-proxy-settings-mobile.png`,
-    fullPage: false,
-    mask: [configuration.locator(".proxy-effective-value, .proxy-server-url")],
-  });
-});
-
-test("custom URL remains complete after refresh and is prefilled for editing", async ({ page }) => {
+/**
+ * E2E-META
+ * Purpose: 自定义明文 URL 在刷新后仍完整保留，并原样预填到编辑表单。
+ * Steps:
+ *   1. 用唯一名称添加带凭据的明文 URL 代理。
+ *   2. 断言列表显示归一化 URL。
+ *   3. 刷新页面后断言条目仍在，编辑表单预填完整 URL。
+ *   4. 删除条目并断言它从列表消失。
+ * Environment: 隔离本地栈；浏览器 egress 仅限 127.0.0.1。
+ * Type: mocked
+ * LLM: none
+ * WebSearch: none
+ * PaperSources: none
+ * MCP: none
+ * OtherExternal: none — 只读写本地设置页。
+ * Credentials: 隔离实例的 E2E_API_TOKEN；代理 URL 中的凭据是合成值。
+ * CostSideEffects: none — 测试创建的代理条目在末尾删除。
+ */
+test("custom URL remains complete after refresh and is prefilled for editing", { tag: "@mocked" }, async ({ page }) => {
   // The E2E stack can keep its data directory between CI attempts. A fixed
   // name makes a retry depend on whether the previous attempt reached the
   // cleanup at the end of this test: if it did not, creating the server fails

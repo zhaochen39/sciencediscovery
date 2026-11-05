@@ -142,7 +142,12 @@ function ProxyUrlGuideTooltip() {
       if (!rootRef.current?.contains(event.target as Node)) dismiss();
     }
     function handleKeyDown(event: KeyboardEvent): void {
-      if (event.key === "Escape") dismiss();
+      if (event.key !== "Escape") return;
+      // Escape belongs to the topmost layer: dismiss this popover without
+      // letting the dialog-level Escape close the whole System configuration
+      // window underneath it.
+      event.stopPropagation();
+      dismiss();
     }
     document.addEventListener("pointerdown", handlePointerDown);
     document.addEventListener("keydown", handleKeyDown);
