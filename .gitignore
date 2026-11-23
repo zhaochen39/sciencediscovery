@@ -30,6 +30,7 @@ coverage/
 !.env.docker.example
 
 # Temporary files and logs
+.ci-retry/
 .tmp/
 .local/
 *.log

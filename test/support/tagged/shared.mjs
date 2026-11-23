@@ -25,6 +25,7 @@ import { preflight } from './environment.mjs';
 import { executionConfig, realShards, mockedShards, mockedBatches } from './execution.mjs';
 import { isProviderFaultOnlyWorkerFailure } from './provider-fault.mjs';
 import { retryableCaseFailures, retryFailed, retryReportMissing, shouldRetryFailedCases } from './retry.mjs';
+import { runIsolatedRetry } from './retry-runner.mjs';
 import { checks } from './checks.mjs';
 import { planGroups, schedule, utWorkers, SWARM, SWARM_TAG } from './scheduler.mjs';
 import { startSwarm, withoutSwarm } from './swarm.mjs';
@@ -415,7 +416,29 @@ export async function main(args=process.argv.slice(2)) {
         const repeatPlan=join(outputDir,`playwright-${key}-retry-plan.json`);json(repeatPlan,subplan(plan,repeatEntries));
         const repeatReport=join(outputDir,`playwright-${key}-retry-results.json`);rmSync(repeatReport,{force:true});
         console.log(`Repeating ${repeatEntries.length} failed case(s): ${repeatEntries.map(e => e.id).join(', ')}`);
-        const again=await browserRun(batch,repeatPlan,repeatReport,`${key}-retry`);
+        const retryInstance = `${key}-retry`;
+        const retryResultsPath = join(
+          process.env.CI_RESULTS_DIR ? resolve(process.env.CI_RESULTS_DIR) : outputDir,
+          retryInstance,
+        );
+        const retryLogPath = join(outputDir, `e2e-${retryInstance}-driver.log`);
+        const retryCode = await runIsolatedRetry({
+          repositoryRoot: root,
+          outputDir,
+          resultsPath: retryResultsPath,
+          planPath: repeatPlan,
+          reportPath: repeatReport,
+          logPath: retryLogPath,
+          instance: retryInstance,
+          group: batch.group,
+          backend: execution.backend,
+          attempt: 1,
+          reason: 'case_failure',
+        });
+        const again = {
+          code: retryCode,
+          data: existsSync(repeatReport) ? JSON.parse(readFileSync(repeatReport)) : undefined,
+        };
         retryReport=again.data;
         if(!again.data) errors.push(retryReportMissing);
         else if(again.code!==0) errors.push(retryFailed(again.code));
