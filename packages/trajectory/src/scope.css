@@ -1,0 +1,13 @@
+.research-scope-explorer { min-width: 0; padding: .5rem .75rem; color: inherit; }
+.research-scope-explorer > summary { width: fit-content; cursor: pointer; font-weight: 600; }
+.research-scope-explorer > section { max-height: min(50vh, 24rem); overflow: auto; margin-top: .55rem; border: 1px solid currentColor; border-radius: .5rem; padding: .65rem; }
+.research-scope-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; }
+.research-scope-toolbar label { display: flex; flex-wrap: wrap; gap: .35rem; align-items: center; }
+.research-scope-toolbar select { max-width: 100%; }
+.research-scope-nodes { list-style: none; padding-inline-start: .85rem; margin: .35rem 0; }
+.research-scope-nodes > li { border-inline-start: 1px solid currentColor; padding: .25rem .4rem; overflow-wrap: anywhere; }
+.research-scope-nodes summary { cursor: pointer; }
+.research-scope-nodes summary span { margin-inline-start: .6rem; font-size: .85em; opacity: .8; }
+.research-scope-memory h4, .research-scope-execution { margin: .4rem 0; }
+.research-scope-memory button { max-width: 100%; overflow-wrap: anywhere; }
+.research-scope-evidence pre { white-space: pre-wrap; overflow-wrap: anywhere; }

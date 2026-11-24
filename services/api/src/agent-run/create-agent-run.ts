@@ -41,6 +41,9 @@ export interface AgentRunBindings {
   planStore?: PlanStore;
   runIdleTimeoutMs?: number;
   readVersioningAuthorities?: () => Promise<unknown>;
+  projectContextHistory?: NativeAgentOptions["projectContextHistory"];
+  swarmRecoveryHistory?: NativeAgentOptions["swarmRecoveryHistory"];
+  researchScope?: NativeAgentOptions["researchScope"];
   suspendAfterTurn?: () => boolean | Promise<boolean>;
   workspace: WorkspaceAgentOptions;
 }
@@ -93,6 +96,9 @@ export function createAgentRun(
       : profile.kind,
     enabledConnectorIds: profile.resources.connectorIds as WorkspaceAgentOptions["enabledConnectorIds"],
     gatewayHistory,
+    ...(bindings.projectContextHistory ? { projectContextHistory: bindings.projectContextHistory } : {}),
+    ...(bindings.swarmRecoveryHistory ? { swarmRecoveryHistory: bindings.swarmRecoveryHistory } : {}),
+    ...(bindings.researchScope ? { researchScope: bindings.researchScope } : {}),
     ...(bindings.runIdleTimeoutMs !== undefined
       ? { runIdleTimeoutMs: bindings.runIdleTimeoutMs }
       : {}),

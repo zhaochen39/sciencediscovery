@@ -163,6 +163,10 @@ for (const sample of cases) {
           e2e_ms: e2eMs, generation_tokens: tokens.total, generation_input_tokens: tokens.input, generation_output_tokens: tokens.output };
         metrics.integration_status = finished.delivery.status;
         metrics.run_id = finished.runId;
+        metrics.spine_observation = { runs: finished.snapshot.runs.length,
+          observed_runs: finished.snapshot.runs.filter(run => run.researchScopes === "observe").length };
+        metrics.measurements.generation_requests = tokens.requests;
+        metrics.measurements.shell_executions = finished.snapshot.activity.executions.length;
         await writeFile(testInfo.outputPath("research-evidence.json"), JSON.stringify({ ...finished, usage, records }, null, 2));
         for (const name of outputs) {
           const artifact = requiredArtifacts(finished.delivery.artifacts, outputs).found.get(name)!;

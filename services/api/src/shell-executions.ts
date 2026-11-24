@@ -1051,6 +1051,65 @@ export class ShellExecutions {
     return this.get(id, owner);
   }
 
+  private outstandingResearchExecutions(sessionId: string, turnId: string): Record[] {
+    const rows = this.db.prepare(`SELECT record FROM shell_executions WHERE session = ? AND agent = 'main'
+      AND json_extract(record, '$.turnId') = ?`).all(sessionId, turnId);
+    return rows.map(row => readRecord(String(row.record))).filter(execution =>
+      execution.runnerId === "local" && !execution.historical && !this.researchShellSettled(execution));
+  }
+
+  researchRunHasOutstandingShell(sessionId: string, turnId: string): boolean {
+    return this.outstandingResearchExecutions(sessionId, turnId).length > 0;
+  }
+
+  /** A Run stop needs authoritative process termination, not a local status override. */
+  async stopResearchRun(sessionId: string, turnId: string, runner: RunnerClient): Promise<string[]> {
+    const owner = { sessionId, agentId: "main" };
+    const outstanding = this.outstandingResearchExecutions(sessionId, turnId);
+    const outcomes = await Promise.all(outstanding.map(async ({ id }) => {
+      const deadline = AbortSignal.timeout(8_000);
+      try {
+        while (!deadline.aborted) {
+          const execution = this.record(id, owner);
+          if (this.researchShellSettled(execution)) return;
+          // A dispatch may still be in flight. A missing Runner record is not
+          // proof that the command cannot start later.
+          if (execution.dispatchPhase !== "prepared") {
+            try {
+              const observation = await runner.cancelShellExecution(id, owner, deadline);
+              this.assertObserved(execution, observation);
+              if (observation.receipt && ["completed", "failed", "cancelled"].includes(observation.state)) {
+                this.assertTerminalEvidence(observation);
+                // After an API restart there may be no observer left to publish
+                // the terminal receipt. Reuse recovery and its lease before
+                // handing the workspace off. A prior lease can outlive the API.
+                if (execution.originalExecutionContext && !this.active.has(id)) {
+                  await this.reconcile(id, owner, this.recovery, () => runner, deadline);
+                  if (!this.researchShellSettled(this.record(id, owner))) return id;
+                }
+                return;
+              }
+            } catch (error) {
+              if (observationHttpStatus(observationFailureChain(error)) !== 404) throw error;
+            }
+          }
+          await this.waitForPoll(200);
+        }
+      } catch (error) {
+        this.log.warn("research_shell_stop_unconfirmed", { id, sessionId, turnId, failure: errorDetail(error) });
+      }
+      return id;
+    }));
+    return outcomes.filter((id): id is string => id !== undefined);
+  }
+
+  private researchShellSettled(execution: Record): boolean {
+    if (["completed", "failed", "cancelled"].includes(execution.state)
+      && execution.finalization === "committed" && execution.provenance === "committed") return true;
+    return execution.dispatchPhase === "prepared" && !this.active.has(execution.id)
+      && !this.db.prepare("SELECT id FROM shell_execution_leases WHERE id = ? AND expires > ?").get(execution.id, Date.now());
+  }
+
   async logs(id: string, owner: ExecutionOwner, runner: (id: string) => RunnerClient, cursor = 0) {
     const execution = this.record(id, owner);
     if (execution.historical) {

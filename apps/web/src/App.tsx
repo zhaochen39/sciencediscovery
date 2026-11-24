@@ -131,6 +131,7 @@ import { replaceDefaultModelOverride } from "./default-model-override.js";
 import { settleLoads, startupLoads, systemSettingsLoads, workspaceCapabilitiesFromQuota } from "./settings-loads.js";
 import { isAuthFailure } from "./api/auth.js";
 import { classifySessionPollMiss } from "./api/session-miss.js";
+import "@sciencediscovery/trajectory/scope.css";
 import { TrajectoryViewer } from "@sciencediscovery/trajectory/web";
 import { createSessionActivity } from "./run-stream/session-activity.js";
 import { artifactsForSession, groupArtifactsBySession, upsertArtifactSession } from "./artifact-session-groups.js";

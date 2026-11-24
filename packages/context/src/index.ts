@@ -18,3 +18,5 @@ export * from "./trace.js";
 export * from "./validator.js";
 export * from "./state-view.js";
 export * from "./state-coordinator.js";
+export * from "./scope-projection.js";
+export * from "./verified-stage-projection.js";

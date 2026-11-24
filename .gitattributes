@@ -5,3 +5,9 @@
 *.yaml text eol=lf
 # CFG-R12: this fixture is executed directly by its env shebang in Linux.
 test/api/fixtures-specialist-runtime.cjs text eol=lf
+
+# Citation fixture manifests bind the exact metadata bytes.
+test/benchmarks/research-spine-value-validation/fixtures/citations/**/*.json text eol=lf
+
+# The local evaluator verifies exact rubric bytes.
+test/benchmarks/biomnibench-da/local-rubrics/*.txt text eol=lf

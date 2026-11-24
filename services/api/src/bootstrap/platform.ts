@@ -728,7 +728,7 @@ export async function initializePlatformServices(
     finalizeFailure: (context, failure) => provenanceRecorder.commitExistingShellExecutionFailure(context, failure),
   });
   await initializeComponent("artifact_recovery", () => artifactManager.resumeInterrupted());
-  await initializeComponent("run_recovery", () => recoverSessionRuns(store, memoryGraphClient));
+  await initializeComponent("run_recovery", () => recoverSessionRuns(store, memoryGraphClient, runnerClient));
   for (const project of store.listProjects()) {
     for (const session of store.listSessions(project.id, "all")) {
       if (session.archivedAt) continue;

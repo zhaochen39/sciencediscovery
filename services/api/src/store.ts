@@ -1660,6 +1660,10 @@ export class SessionStore {
     if (exists("configuration_native_runs_v3")) this.database.prepare("DELETE FROM configuration_native_runs_v3 WHERE session_id=?").run(sessionId);
     if (exists("configuration_credential_drafts")) new ConfigurationCredentialBridge(this.database, this.configurationSecretCipher()).clearSession(sessionId);
     if (exists("configuration_endpoint_consents")) this.database.prepare("DELETE FROM configuration_endpoint_consents WHERE session_id=?").run(sessionId);
+    if (exists("research_scope_events_v1")) this.database.prepare("DELETE FROM research_scope_events_v1 WHERE session_id=?").run(sessionId);
+    if (exists("research_scope_artifacts_v1")) this.database.prepare("DELETE FROM research_scope_artifacts_v1 WHERE session_id=?").run(sessionId);
+    if (exists("research_scope_executions_v1")) this.database.prepare("DELETE FROM research_scope_executions_v1 WHERE session_id=?").run(sessionId);
+    if (exists("research_scope_swarm_branches_v1")) this.database.prepare("DELETE FROM research_scope_swarm_branches_v1 WHERE session_id=?").run(sessionId);
   }
 
 
@@ -7364,6 +7368,9 @@ export class SessionStore {
     prompt: string;
     references?: ComposerReference[];
     retryOfRunId?: string;
+    delegationMode?: SessionRun["delegationMode"];
+    researchResume?: SessionRun["researchResume"];
+    researchScopes?: SessionRun["researchScopes"];
     sessionId: string;
     settingsSnapshot: SessionRun["settingsSnapshot"];
     skillLibraryRefs?: SessionRun["skillLibraryRefs"];
@@ -7377,6 +7384,19 @@ export class SessionStore {
     // other with stale snapshots (lost update). queueOrder is derived from the
     // latest array inside the barrier for the same reason.
     return await this.mutateArray<SessionRun, SessionRun>(this.sessionRunsPath(input.sessionId), (runs) => {
+      if (input.researchResume) {
+        const binding = input.researchResume;
+        const prior = runs.find(run => run.researchResume?.sourceRunId === binding.sourceRunId);
+        if (prior) {
+          if (prior.researchResume?.workflow !== binding.workflow || prior.prompt !== prompt) {
+            throw new SessionStoreHttpError("This checkpoint already has a different continuation", 409);
+          }
+          return structuredClone(prior);
+        }
+        if (runs.some(run => !["completed", "cancelled", "failed", "interrupted"].includes(run.status))) {
+          throw new SessionStoreHttpError("An active Run already owns the workspace", 409);
+        }
+      }
       const run: SessionRun = {
         ...(input.notificationDelivery ? { notificationDelivery: structuredClone(input.notificationDelivery) } : {}),
         ...(input.automaticWake ? { automaticWake: true } : {}),
@@ -7387,6 +7407,9 @@ export class SessionStore {
         queueOrder: runs.reduce((max, candidate) => Math.max(max, candidate.queueOrder), 0) + 1,
         references: structuredClone(input.references ?? []),
         ...(input.retryOfRunId ? { retryOfRunId: input.retryOfRunId } : {}),
+        ...(input.delegationMode ? { delegationMode: input.delegationMode } : {}),
+        ...(input.researchResume ? { researchResume: structuredClone(input.researchResume) } : {}),
+        ...(input.researchScopes ? { researchScopes: input.researchScopes } : {}),
         sessionId: input.sessionId,
         settingsSnapshot: {
           ...structuredClone(input.settingsSnapshot),

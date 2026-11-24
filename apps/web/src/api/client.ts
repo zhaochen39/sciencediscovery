@@ -1,3 +1,4 @@
+import { createScopePort } from "@sciencediscovery/trajectory/scope";
 // Copyright (C) 2026-2026 Huawei Technologies Co., Ltd
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -44,6 +45,7 @@ export class ApiClient extends WebApiClient {
     return await response.json();
   }
   readonly trajectory: TrajectoryPort = {
+    scope: createScopePort((path, signal) => this.request(path, { signal })),
     index: (id, signal) => this.request(`/api/sessions/${encodeURIComponent(id)}/trajectory`, { signal }),
     detail: (id, entry, signal) => this.request(`/api/sessions/${encodeURIComponent(id)}/trajectory/detail?id=${encodeURIComponent(entry)}`, { signal }),
     export: async (id, signal) => {

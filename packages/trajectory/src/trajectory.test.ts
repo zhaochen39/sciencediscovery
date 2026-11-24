@@ -375,3 +375,26 @@ test("MCP audit detail resolves owned payloads and redacts credentials", async (
     assert.doesNotMatch(JSON.stringify(detail), /private-token/);
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
+
+
+test("research recovery events replay as ordered run-scoped trajectory entries", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "trajectory-research-replay-"));
+  try {
+    const actions = ["retained-evidence", "evidence-retired", "shell-stop-confirmed"];
+    const events: RecordedEvent[] = actions.map((action, sequence) => ({
+      id: `recovery-${sequence}`, agentId: "main", runId: "run", streamId: "main", sequence,
+      createdAt: "2026-11-26T00:00:00Z",
+      event: { type: "research.recovery", action, sourceRunId: "source", checkpointDigest: "sha256:checkpoint" },
+    }));
+    const input = { sessionId: "session", agents: [{ id: "main", label: "Main" }], events };
+    for (const replay of [events, [...events].reverse()]) {
+      const view = await openSessionTrajectory(directory, { ...input, events: replay }, new AbortController().signal);
+      assert.deepEqual(view.index.entries.map(entry => entry.label), actions);
+      for (const [sequence, entry] of view.index.entries.entries()) {
+        assert.equal(entry.runId, "run");
+        assert.equal(entry.sequence, sequence);
+        assert.deepEqual((await view.detail(entry.id))?.value, events[sequence]!.event);
+      }
+    }
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});

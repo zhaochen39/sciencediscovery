@@ -25,6 +25,9 @@ other real workers retain those variables. Changing variables cannot perform
 a Biomni thinking A/B: use a separate configuration change for that experiment.
 The A/B and valid scored-suite evidence requested in #817 remain outstanding.
 
+For a controlled same-revision JiuwenSwarm comparison, see the
+[Spine A/B runbook](./spine-ab-2026-11-27.md).
+
 ## Resumable serial execution on a shared host
 
 Prepare and build an isolated, committed checkout first, including the pinned

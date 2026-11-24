@@ -198,11 +198,13 @@ import {
 } from "@sciencediscovery/specialist";
 import { MAX_PAPER_PDF_BYTES, PaperService } from "../papers.js";
 import { closedModelContext } from "./model-context.js";
+import { loadResearchCheckpoint, researchRecoveryMode, sealResearchCheckpoint } from "./research-checkpoint.js";
 import { RemoteComputeClient } from "@sciencediscovery/executor";
 import { effectiveModelTurns } from "@sciencediscovery/runtime-core";
 import { classifySubagentFailure } from "@sciencediscovery/specialist";
 import { jiuwenSwarmConfigFromEnv } from "../agent-run/jiuwenswarm-agent.js";
 import { createConfigurationAgentTools } from "../configuration/agent-tools.js";
+import { ScopeLedger, scopeTool } from "./scope-ledger.js";
 import { runMainRequestExecution, runSubagentTask } from "../agent-run/orchestrators.js";
 import { createAgentPermissionRuntime } from "@sciencediscovery/governance";
 import type { EvolveRunProposal } from "@sciencediscovery/schema";
@@ -211,6 +213,7 @@ import type { EvolutionStore } from "../evolution/store.js";
 import { createRequestExecutionContext } from "../agent-run/request-execution.js";
 import { createWorkspaceExecutionBindings } from "../agent-run/workspace-bindings.js";
 import { prepareSkillSandbox, skillPackageSetHash } from "../skill-sandbox.js";
+import { researchCheckpointContract } from "./research-workflows.js";
 import { remoteWorkspaceKey, syncRemoteWorkspace } from "../remote-runner.js";
 import {
   reviewerSpecialistAvailable,
@@ -750,6 +753,25 @@ async function executeAgentRun(
   if (session.archivedAt) {
     throw new ApiStatusError(409, "Session is archived and read-only");
   }
+  const researchBinding = persistedRun?.researchResume;
+  const inlineDelegation = persistedRun?.delegationMode === "inline";
+  if (persistedRun?.researchScopes && !jiuwenSwarmConfigFromEnv()) {
+    throw new ApiStatusError(409, "Research Scopes require JiuwenSwarm");
+  }
+  const scope = persistedRun?.researchScopes
+    ? new ScopeLedger(store.getConfigurationDatabase(), store.dataDir, sessionId, persistedRun.id)
+    : undefined;
+  const allowedRemoteHosts = store.effectiveRemoteRunnerHosts(sessionId);
+  if ((researchBinding || inlineDelegation || scope) && allowedRemoteHosts.length) {
+    throw new ApiStatusError(409, "This Run requires a local workspace");
+  }
+  const scopedVersion = (id: string) => {
+    const version = store.getArtifactVersion(sessionId, id);
+    return version?.sessionId === sessionId && version.turnId === scope?.runId ? version : undefined;
+  };
+  const research = researchBinding
+    ? await loadResearchCheckpoint(store, sessionId, researchBinding, Boolean(jiuwenSwarmConfigFromEnv()))
+    : undefined;
   const project = store.getProject(session.projectId);
   if (!project) throw new ApiStatusError(404, "Project not found");
   // Validate the queued run's frozen selection before touching execution services.
@@ -760,7 +782,6 @@ async function executeAgentRun(
   // Remote machines are an addition, not a replacement: this run always has the
   // local runner, and each allowed machine is one more place the model may ask
   // to run. A machine that is not connected only fails the calls that name it.
-  const allowedRemoteHosts = store.effectiveRemoteRunnerHosts(sessionId);
   const remoteTargets = allowedRemoteHosts.map((host) => ({
     runnerId: host.id,
     hostAlias: host.runnerName ?? host.alias,
@@ -1008,14 +1029,14 @@ async function executeAgentRun(
       createdAt: goalMessage.createdAt,
     });
   }
-  const promptHistory: AgentHistoryMessage[] = configurationResume && storedCheckpoint
+  const promptHistory: AgentHistoryMessage[] = research?.history ?? (configurationResume && storedCheckpoint
     ? closedModelContext(checkpointHistory)
     : previousMessages.flatMap((message) => {
     if (message.role === "assistant" && message.modelContext?.length) {
       return closedModelContext(message.modelContext as AgentHistoryMessage[]);
     }
     return [{ role: message.role, content: messagePromptContent(message) }];
-  });
+  }));
   const manifestHistory = previousMessages.map((message) => ({
     ...message,
     content: messagePromptContent(message),
@@ -2497,8 +2518,36 @@ async function executeAgentRun(
     ...(sessionSpecialist ? { specialistId: sessionSpecialist.id } : {}),
     workspaceRoot: store.workspacePath(sessionId),
   });
+  const scopeExecutionTools = scope ? new Set(["task", "tree_claim", "tree_checkpoint", "tree_complete", "tree_fail",
+    "create_evolve_run", "create_idea_research", "subagent_spawn", "subagent_wait", "run_shell", "run_python", "declare_artifact", "declare_claim", "declare_evidence",
+  ]) : undefined;
   const observeMainEvent: NonNullable<import("../agent-run/create-agent-run.js").AgentRunBindings["observer"]> = (event) => {
     const publish = (value: RunStreamEvent) => emit({ ...value, ...(event.evidence ? { evidence: event.evidence } : {}) });
+    if (scope && (event.type === "tool_execution_start" || event.type === "tool_execution_end") && scopeExecutionTools?.has(event.toolName)) {
+      try {
+        if (event.type === "tool_execution_start") {
+          scope.beginExecution(event.toolCallId, event.toolName, persistedRun?.researchScopes === "observe");
+        } else {
+          const details = event.result.details as {
+            id?: string; state?: string; status?: string; refusedBecause?: string; evidenceId?: string; claimId?: string;
+            subagent?: { id?: string }; run?: { id?: string }; execution?: { id?: string }; treeId?: string; researchId?: string;
+            version?: { id?: string };
+          } | undefined;
+          const version = event.toolName === "declare_artifact" && details?.version?.id ? scopedVersion(details.version.id) : undefined;
+          const swarmChild = !event.isError && ["subagent_spawn", "subagent_wait"].includes(event.toolName)
+            ? scope.recordSwarmDelegation(event.toolCallId, event.toolName, aggregateToolText(event.result) ?? "",
+              traces.get(event.toolCallId)?.args?.subagent_ids)
+            : undefined;
+          const reference = swarmChild ?? version?.id ?? details?.subagent?.id ?? details?.run?.id ?? details?.execution?.id
+            ?? details?.researchId ?? details?.treeId ?? details?.evidenceId ?? details?.claimId ?? details?.id;
+          const failed = event.isError || Boolean(details?.refusedBecause) || ["failed", "cancelled", "error"].includes(details?.state ?? details?.status ?? "");
+          const status = failed ? "failed" : ["queued", "running"].includes(details?.state ?? "") ? "running" : "completed";
+          scope.endExecution(event.toolCallId, status, typeof reference === "string" ? reference : null, version?.id);
+        }
+      } catch (error) {
+        runLog.warn("research_scope_execution_link_failed", { sessionId, runId, error: runFailureMessage(error) });
+      }
+    }
     const active = activeSessions.get(sessionId);
     if (active) active.lastActivityAt = new Date().toISOString();
     if (event.type === "model_usage") {
@@ -2557,6 +2606,7 @@ async function executeAgentRun(
     }
     if (event.type === "tool_execution_end") {
       const text = aggregateToolText(event.result);
+      research?.observeTool(event.toolName, event.isError, event.result.details, text, traces.get(event.toolCallId)?.args);
       if (event.isError) rememberTimeout(timeoutFailure(text));
       if (text !== undefined) {
         void publish({ chunk: text, toolCallId: event.toolCallId, type: "tool.output" });
@@ -2578,6 +2628,15 @@ async function executeAgentRun(
     }
   };
 
+  const publishResearchAudit = async (action: Extract<RunStreamEvent, { type: "research.recovery" }>["action"],
+    details: { reason?: string; turn?: number } = {}) => {
+    if (!researchBinding) return;
+    await emit({ type: "research.recovery", action, checkpointDigest: researchBinding.ref.digest,
+      sourceRunId: researchBinding.sourceRunId, workflow: researchBinding.workflow, ...details });
+  };
+
+  if (inlineDelegation) mainProfile.toolPolicy.deniedToolNames.push("task");
+
   mainExecution = runMainRequestExecution({
     bindings: {
       pluginSettings: settingsSnapshot.plugins,
@@ -2585,6 +2644,24 @@ async function executeAgentRun(
       observer: observeMainEvent,
       recordEvent: async (event) => { await emit(event); },
       planStore: createRunPlanStore("main"),
+      ...(scope && persistedRun?.researchScopes === true ? { researchScope: {
+        tool: scopeTool(scope, versionId => Boolean(scopedVersion(versionId))),
+        context: () => scope.context(),
+        ...(process.env.SCIENCE_AGENT_JIUWENSWARM_SCOPE_FOLD_CLOSED === "1" ? {
+          closedShellEvidence: () => scope.closedShellEvidence(id => {
+            const version = scopedVersion(id);
+            if (!version?.sourcePath) return;
+            const revision = store.getWorkspaceFileProvenance(sessionId, version.sourcePath)?.currentRevision;
+            if (revision?.contentHash !== version.content.hash || !revision.artifactVersionIds.includes(id)) return;
+            return { id, hash: version.content.hash, path: version.sourcePath };
+          }),
+        } : {}),
+      } } : {}),
+      ...(research?.swarmHistory ? { swarmRecoveryHistory: research.swarmHistory } : {}),
+      ...(research?.createProjection ? { projectContextHistory: research.createProjection((state, turn) => {
+        runLog.info("research_recovery_evidence", { sessionId, runId, state, turn });
+        return publishResearchAudit(state === "retired" ? "evidence-retired" : "evidence-restored", { turn });
+      }) } : {}),
       readVersioningAuthorities: versioningAuthorities(store, {
         sessionId, executionId: requestExecution.identity.executionId,
       }),
@@ -2593,7 +2670,9 @@ async function executeAgentRun(
         request.runId === runId && CONFIGURATION_PENDING_STATES.has(request.state)),
       workspace: agentOptions,
     },
-    profile: mainProfile,
+    profile: research?.restrictedTools ? { ...mainProfile, toolPolicy: {
+      ...mainProfile.toolPolicy, allowedToolNames: ["run_shell", "execution_status", "execution_logs"],
+    } } : mainProfile,
     requestExecutionId: requestExecution.identity.executionId,
   });
   externalWaitByExecution.set(
@@ -2630,11 +2709,20 @@ async function executeAgentRun(
     }
     lastAgentUsage = unreportedModelUsage();
     taskInvocationAttempted = true;
+    if (research) {
+      runLog.info("research_recovery_route", { sessionId, runId, route: research.route, reason: research.reason,
+        sourceRunId: researchBinding?.sourceRunId });
+      await publishResearchAudit(research.route === "full" ? "full-history" : "retained-evidence", { reason: research.reason });
+    }
+    const initialPrompt = research?.handoff ? `${promptUserMessage.content}\n\n${research.handoff}` : promptUserMessage.content;
     const initialResult = await mainExecution.executeAgentRun({
       history: promptHistory,
-      prompt: promptUserMessage.content,
+      prompt: initialPrompt,
       purpose: "initial",
     });
+    if (scope && !initialResult.suspended && scope.state().activeId !== "root") {
+      throw new Error("Research Scope is still open. The Run did not commit a scoped delivery");
+    }
     if (initialResult.suspended) {
       const request = listConfigurationInteractions(store, sessionId).find((item) =>
         item.runId === runId && CONFIGURATION_PENDING_STATES.has(item.state));
@@ -2676,7 +2764,7 @@ async function executeAgentRun(
       ? initialResult.finalMessages.findLastIndex((message) => message.role === "user"
         && message.content === checkpointHistory.findLast((entry) => entry.role === "user")?.content)
       : initialResult.finalMessages.findLastIndex((message) => (
-        message.role === "user" && message.content === promptUserMessage.content
+        message.role === "user" && message.content === initialPrompt
       ));
     assistantModelContext = promptIndex >= 0
       ? closedModelContext(initialResult.finalMessages.slice(promptIndex + 1))
@@ -2685,6 +2773,29 @@ async function executeAgentRun(
     assertRunActive();
     await flushWorkspaceRefresh();
     assertRunActive();
+    if (research) {
+      if (store.shellExecutions.researchRunHasOutstandingShell(sessionId, runId)) {
+        throw new Error("Research Run has an unconfirmed Shell execution at delivery");
+      }
+      const verifiedOutputs = await research.verifyDelivery();
+      if (research.swarmHistory && verifiedOutputs.length) {
+        const executions = await store.listExecutionRuns(sessionId);
+        for (const { path, hash } of verifiedOutputs) {
+          assertRunActive();
+          const execution = executions.findLast(entry => entry.turnId === runId && entry.status === "succeeded"
+            && [...entry.createdFiles, ...entry.modifiedFiles].includes(path));
+          if (!execution) throw new Error(`Verified output has no committed producer: ${path}`);
+          const { version } = await provenanceRecorder.registerWorkspaceArtifact({
+            sessionId, turnId: runId, path, workspaceRoot: store.workspacePath(sessionId),
+            executionRunIds: [execution.id], expectedContentHash: hash, forceNewVersion: true,
+            origin: "server_generated", originMeta: { researchCheckpointVerified: true },
+          });
+          if (version.turnId !== runId) throw new Error(`Verified output has no version for this Run: ${path}`);
+          if (scope) scope.linkArtifact(version.id, execution.id);
+        }
+      }
+      await publishResearchAudit("delivery-verified");
+    }
     await persistObservedTimeouts();
     if (!assistantText) {
       // A reasoning model can spend the whole per-call budget on hidden thought
@@ -3464,6 +3575,55 @@ export async function createQueuedRun(
   const slashRefresh = submittedPrompt?.startsWith("/web-refresh ");
   const prompt = slashRefresh ? submittedPrompt!.slice("/web-refresh ".length).trim() : submittedPrompt;
   if (!prompt) throw new ApiStatusError(400, "Message content is required");
+  const delegationMode = body.delegationMode;
+  const scopesAvailable = () => process.env.SCIENCE_AGENT_JIUWENSWARM_SCOPES === "1"
+    && Boolean(jiuwenSwarmConfigFromEnv()) && !store.effectiveRemoteRunnerHosts(sessionId).length;
+  let researchScopes = body.researchScopes;
+  if (researchScopes !== undefined) {
+    if (![true, "observe"].includes(researchScopes) || (researchScopes === true && body.researchResume !== undefined)) {
+      throw new ApiStatusError(400, "Invalid Research Scope request");
+    }
+    if (!scopesAvailable() || (researchScopes === true && process.env.SCIENCE_AGENT_JIUWENSWARM_SCOPE_MANUAL !== "1")) {
+      throw new ApiStatusError(409, "Research Scopes require an enabled JiuwenSwarm local workspace");
+    }
+  } else if (process.env.SCIENCE_AGENT_JIUWENSWARM_SCOPE_DEFAULT === "observe" && scopesAvailable()) {
+    researchScopes = "observe";
+  }
+  if (delegationMode !== undefined) {
+    if (delegationMode !== "inline" || body.researchResume !== undefined) {
+      throw new ApiStatusError(400, "Invalid inline delegation request");
+    }
+    if (store.effectiveRemoteRunnerHosts(sessionId).length) {
+      throw new ApiStatusError(409, "Inline delegation requires a local workspace");
+    }
+  }
+  let researchResume: SessionRun["researchResume"];
+  if (body.researchResume !== undefined) {
+    const request = body.researchResume;
+    if (!request || typeof request.sourceRunId !== "string" || !request.sourceRunId
+      || !researchCheckpointContract(request.workflow)) {
+      throw new ApiStatusError(400, "Invalid research checkpoint request");
+    }
+    const prior = (await store.listSessionRuns(sessionId)).find(run => run.researchResume?.sourceRunId === request.sourceRunId);
+    if (prior) {
+      if (prior.researchResume?.workflow !== request.workflow || prior.prompt !== prompt) {
+        throw new ApiStatusError(409, "This checkpoint already has a different continuation");
+      }
+      return prior;
+    }
+    const mode = researchRecoveryMode(sessionId);
+    if (!mode || store.effectiveRemoteRunnerHosts(sessionId).length) {
+      throw new ApiStatusError(409, "Research checkpoint recovery requires an enabled session with a local workspace");
+    }
+    if (body.references?.length || body.annotationIds?.length || body.skillLibraryRefs?.length || body.webForceRefresh || slashRefresh) {
+      throw new ApiStatusError(400, "Research checkpoint continuations do not accept new resources");
+    }
+    try {
+      researchResume = await sealResearchCheckpoint(store, sessionId, request.sourceRunId, request.workflow, mode, Boolean(jiuwenSwarmConfigFromEnv()));
+    } catch (error) {
+      throw new ApiStatusError(409, error instanceof Error ? error.message : "Invalid research checkpoint");
+    }
+  }
   let references: ComposerReference[];
   try {
     references = await resolveComposerReferences(body.references, sessionId, store, skillCatalog);
@@ -3512,6 +3672,9 @@ export async function createQueuedRun(
     settingsSnapshot,
     ...(skillLibraryRefs.length ? { skillLibraryRefs } : {}),
     webForceRefresh: body.webForceRefresh === true || slashRefresh,
+    ...(researchResume ? { researchResume } : {}),
+    ...(delegationMode ? { delegationMode } : {}),
+    ...(researchScopes ? { researchScopes } : {}),
   });
   // A Stop received while validating/enqueuing this request wins over the earlier request.
   // A later user message may queue behind a parked run. It must not rotate the
@@ -3522,7 +3685,7 @@ export async function createQueuedRun(
     !isTerminalRunStatus(candidate.status) && (candidate.configurationWait || candidate.configurationResume));
   if (!pendingConfiguration && !resumingConfiguration) store.notifications.resume(sessionId, wakeGeneration);
   const unread = store.notifications.prepareDelivery({ sessionId, agentId: "main" });
-  if (unread) run = await store.updateSessionRun(sessionId, run.id, { notificationDelivery: unread });
+  if (unread && !researchResume) run = await store.updateSessionRun(sessionId, run.id, { notificationDelivery: unread });
   const renamedSession = await applyInitialSessionTitle(store, run);
   if (renamedSession) await publishRunEvent(store, sessionId, run.id, {
     session: renamedSession,
@@ -3766,6 +3929,7 @@ export function scheduleSessionRuns(
             continue;
           }
           // Context was persisted with the queued run; Stop can still abort the active controller.
+          await ensureResearchWorkspaceQuiescent(store, runnerClient, sessionId, runs);
           if (delivery) store.notifications.acknowledge(delivery);
           status = await executeAgentRun(
             store,
@@ -3821,6 +3985,11 @@ export function scheduleSessionRuns(
         } finally {
           await deltaSink.flush();
           await eventQueue;
+          if (next.researchResume && (status === "cancelled" || status === "failed" || status === "interrupted")) {
+            await stopResearchRunShells(store, runnerClient, sessionId, next.id).catch(error => {
+              runLog.warn("research_shell_stop_audit_failed", { sessionId, runId: next.id, error: runFailureMessage(error) });
+            });
+          }
           cancelledRuns.delete(next.id);
           const finished = await store.updateSessionRunStatus(sessionId, next.id, status, {
             ...(error && status === "failed" ? { error } : {}),
@@ -3937,7 +4106,77 @@ export function scheduleSessionRuns(
   });
 }
 
-export async function recoverSessionRuns(store: SessionStore, memoryGraphClient: MemoryGraphClient | null = null): Promise<void> {
+export async function ensureResearchWorkspaceQuiescent(store: SessionStore, runner: RunnerClient, sessionId: string,
+  runs?: SessionRun[]): Promise<void> {
+  const priorRuns = runs ?? await store.listSessionRuns(sessionId);
+  for (const prior of priorRuns) {
+    if (!prior.researchResume) continue;
+    if (!isTerminalRunStatus(prior.status)) {
+      if (!runs && prior.status === "running") throw new ApiStatusError(409, "Research Run still owns this workspace", "RESEARCH_WORKSPACE_IN_USE");
+      continue;
+    }
+    const pending = await store.shellExecutions.stopResearchRun(sessionId, prior.id, runner);
+    if (pending.length) throw new ApiStatusError(409,
+      "A previous research Run has unconfirmed Shell executions. Inspect agent activity before retrying.",
+      "RESEARCH_SHELL_STOP_UNCONFIRMED");
+  }
+}
+
+async function stopResearchRunShells(store: SessionStore, runner: RunnerClient, sessionId: string, runId: string): Promise<void> {
+  const pending = await store.shellExecutions.stopResearchRun(sessionId, runId, runner).catch((error: unknown) => {
+    runLog.warn("research_shell_stop_failed", { sessionId, runId, error: runFailureMessage(error) });
+    return undefined;
+  });
+  runLog.info("research_shell_stop", { sessionId, runId, pending });
+  const binding = (await store.getSessionRun(sessionId, runId))?.researchResume;
+  if (!binding) return;
+  await publishRunEvent(store, sessionId, runId, {
+    type: "research.recovery",
+    action: pending?.length === 0 ? "shell-stop-confirmed" : "shell-stop-unconfirmed",
+    sourceRunId: binding.sourceRunId,
+    workflow: binding.workflow,
+    checkpointDigest: binding.ref.digest,
+    ...(pending?.length ? { reason: `${pending.length} execution(s) await Runner confirmation` } : {}),
+  });
+}
+
+async function recoverInterruptedResearchUsage(store: SessionStore, session: Session, run: SessionRun, finishedAt: string): Promise<void> {
+  const modelProfileId = run.settingsSnapshot.modelId;
+  if (!modelProfileId) return;
+  const events = await store.listSessionRunEvents(session.id, run.id);
+  let usage = unreportedModelUsage();
+  let turnsRecorded = 0;
+  for (const { event } of events) {
+    if (event.type !== "model.usage") continue;
+    usage = addCapturedModelUsage(usage, capturedModelUsage({ usage: event.usage, usageReported: true }));
+    turnsRecorded++;
+  }
+  if (!turnsRecorded) return;
+  const existing = await store.listModelInvocationUsage(session.id);
+  if (existing.some(row => row.runId === run.id && row.invocationKind === "task")) return;
+  const model = store.getModel(modelProfileId);
+  await store.appendModelInvocationUsage({
+    ...usage,
+    attemptIndex: 0,
+    costUsd: null,
+    finishedAt,
+    id: randomUUID(),
+    invocationId: `interrupted-research:${run.id}`,
+    invocationKind: "task",
+    model: model?.model ?? modelProfileId,
+    modelProfileId,
+    modelProfileName: model?.name ?? modelProfileId,
+    outcome: "failed",
+    projectId: session.projectId,
+    runId: run.id,
+    sessionId: session.id,
+    startedAt: run.startedAt ?? run.createdAt,
+    turnsRecorded,
+  });
+}
+
+export async function recoverSessionRuns(store: SessionStore, memoryGraphClient: MemoryGraphClient | null = null,
+  runnerClient?: RunnerClient): Promise<void> {
   for (const project of store.listProjects()) {
     for (const session of store.listSessions(project.id, "all")) {
       if (isEvidenceSessionReadOnly(session)) continue;
@@ -3984,10 +4223,20 @@ export async function recoverSessionRuns(store: SessionStore, memoryGraphClient:
         // proposal as an actionable legacy continuation after interruption.
         store.invalidateConnectorConfigurationRequestsForStop(session.id, run.id);
         const reason = "API process exited before this run reached a terminal state";
-        const interrupted = await store.updateSessionRunStatus(session.id, run.id, "interrupted", {
-          error: reason,
-          finishedAt: new Date().toISOString(),
-        });
+        if (run.researchResume && runnerClient) {
+          await stopResearchRunShells(store, runnerClient, session.id, run.id).catch(error => {
+            runLog.warn("research_shell_stop_audit_failed", { sessionId: session.id, runId: run.id, error: runFailureMessage(error) });
+          });
+        }
+        const finishedAt = new Date().toISOString();
+        if (run.researchResume) {
+          // A process exit can leave per-turn usage durable before the normal
+          // task row was written. Recover only what the provider reported.
+          await recoverInterruptedResearchUsage(store, session, run, finishedAt).catch(error => {
+            runLog.warn("research_usage_recovery_failed", { sessionId: session.id, runId: run.id, error: runFailureMessage(error) });
+          });
+        }
+        const interrupted = await store.updateSessionRunStatus(session.id, run.id, "interrupted", { error: reason, finishedAt });
         runLog.warn("run_interrupted", {
           reason: "api_process_exit",
           runId: run.id,

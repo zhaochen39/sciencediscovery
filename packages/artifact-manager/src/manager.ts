@@ -47,6 +47,8 @@ export interface ArtifactContentPort {
 }
 
 export interface RegisterWorkspaceArtifactInput {
+  /** Reject publication if the workspace bytes changed after verification. */
+  expectedContentHash?: string;
   artifactId?: string;
   baseVersionId?: string;
   publicationId?: string;
@@ -103,6 +105,9 @@ export class ArtifactManager {
     version: ScientificArtifactVersion;
   }> {
     const content = await this.content.putWorkspaceFile(input.workspaceRoot, input.path);
+    if (input.expectedContentHash !== undefined && content.hash !== input.expectedContentHash) {
+      throw new Error("Workspace artifact changed before publication");
+    }
     return await this.catalog.createVersion({
       content,
       artifactId: input.artifactId, baseVersionId: input.baseVersionId, publicationId: input.publicationId,

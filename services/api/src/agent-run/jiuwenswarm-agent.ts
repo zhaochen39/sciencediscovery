@@ -21,6 +21,7 @@ import { TOOL_SEARCH_NAME, TOOL_SEARCH_SPEC, requiredArgumentsOf, type AgentTool
 
 import { DurableContextStore } from "@sciencediscovery/context";
 
+import { createSwarmHistoryProjection } from "./jiuwenswarm-scope-projection.js";
 import { startModelGateway, withoutWithheldNotice, type ModelGateway } from "./jiuwenswarm-model-gateway.js";
 import { importSkillsToJiuwenSwarm, listJiuwenSwarmSkills, skillLoadedBy } from "./jiuwenswarm-skills.js";
 import { seedHistoryText } from "./history-seed.js";
@@ -374,11 +375,12 @@ class JiuwenSwarmAgent implements NativeAgentHandle {
     });
     // With JiuwenSwarm's own todo tools the model does not also get ours. Only in place of ours: a run whose Plan
     // plugin is switched off has no update_plan, and then no planning tool of either kind.
-    const jiuwenSwarmPlans = (this.config.planning ?? "todo") === "todo" && Boolean(this.options.planStore) && tools.has("update_plan");
+    const jiuwenSwarmPlans = this.options.swarmRecoveryHistory === undefined && (this.config.planning ?? "todo") === "todo" && Boolean(this.options.planStore) && tools.has("update_plan");
     if (jiuwenSwarmPlans) tools.delete("update_plan");
     // Web search and page fetching are JiuwenSwarm's own when its tools are in use, but only in place of ours: a run
     // without web_search or web_fetch (Web access unchecked for the Session) must not get JiuwenSwarm's either.
-    const allJiuwenSwarmTools = (this.config.tools ?? "jiuwenswarm") === "jiuwenswarm";
+    const allJiuwenSwarmTools = this.options.swarmRecoveryHistory === undefined
+      && (this.config.tools ?? "jiuwenswarm") === "jiuwenswarm";
     const hiddenWebTools = allJiuwenSwarmTools
       ? Object.entries(JIUWENSWARM_NATIVE_WEB_TOOLS).flatMap(([ours, theirs]) => tools.has(ours) ? [] : theirs) : [];
     if (allJiuwenSwarmTools) for (const name of Object.keys(JIUWENSWARM_WEB_TOOLS)) tools.delete(name);
@@ -389,7 +391,7 @@ class JiuwenSwarmAgent implements NativeAgentHandle {
     // would bypass ScienceDiscovery's approvals and audit. ScienceDiscovery's own
     // `task` bridge stays available.
     const jiuwenSwarmSubagents = allJiuwenSwarmTools && this.options.unsandboxedExecution !== true
-      && (this.config.subagents ?? "task") === "jiuwenswarm" && tools.has("task");
+      && !this.options.researchScope && (this.config.subagents ?? "task") === "jiuwenswarm" && tools.has("task");
     if (jiuwenSwarmSubagents) tools.delete("task");
     await this.installSkills(tools, allJiuwenSwarmTools);
     this.loadSkill = (id) => {
@@ -423,7 +425,16 @@ class JiuwenSwarmAgent implements NativeAgentHandle {
         recoversWithheldCalls: !jiuwenSwarmSubagents,
         // A call that leaves out an argument its tool cannot run without is withheld and re-issued
         // by the model, instead of the run carrying a failed card for a call that never ran.
-        requiredArguments: requiredArgumentsOf(registry.values()) });
+        requiredArguments: requiredArgumentsOf(registry.values()),
+        projectHistory: createSwarmHistoryProjection({
+          prompt: text, sessionId: this.options.sessionId, runId: this.options.versioning?.trajectoryId,
+          recoveryHistory: this.options.swarmRecoveryHistory, projectRecoveryHistory: this.options.projectContextHistory,
+          projectScopes: !this.options.researchScope && !jiuwenSwarmSubagents
+            && process.env.SCIENCE_AGENT_JIUWENSWARM_SCOPE_PROJECTION === "1",
+          scopeContext: this.options.researchScope?.context,
+          closedShellEvidence: this.options.researchScope?.closedShellEvidence,
+        }),
+      });
     const deadlines = new RunDeadlines(this.options.runTimeoutMs ?? DEFAULT_AGENT_TURN_TIMEOUT_MS,
       this.options.runIdleTimeoutMs ?? DEFAULT_AGENT_IDLE_TIMEOUT_MS, () => {
         this.logGatewayProgress(`${deadlines.expired ?? "unknown"}_deadline_expired`, modelGateway);
@@ -653,7 +664,8 @@ class JiuwenSwarmAgent implements NativeAgentHandle {
     // Appended after JiuwenSwarm's own prompt, its todo section already says how to plan; only when its prompt is
     // replaced does the model need to be told about the todo tools here.
     const keepJiuwenSwarmPrompt = (this.config.prompt ?? "prepend") === "prepend";
-    const allJiuwenSwarmTools = (this.config.tools ?? "jiuwenswarm") === "jiuwenswarm";
+    const allJiuwenSwarmTools = this.options.swarmRecoveryHistory === undefined
+      && (this.config.tools ?? "jiuwenswarm") === "jiuwenswarm";
     // With JiuwenSwarm's tools the model is no longer limited to the ones registered here, and the rules about
     // web content name JiuwenSwarm's web tools.
     const ours = allJiuwenSwarmTools

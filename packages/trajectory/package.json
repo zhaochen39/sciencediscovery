@@ -8,6 +8,8 @@
     "./server": { "types": "./src/server.ts", "default": "./dist/server.js" },
     "./journal": { "types": "./src/journal.ts", "default": "./dist/journal.js" },
     "./web": { "types": "./src/web.tsx", "default": "./dist/web.js" },
+    "./scope": { "types": "./src/scope-explorer.tsx", "default": "./dist/scope-explorer.js" },
+    "./scope.css": "./src/scope.css",
     "./style.css": "./src/style.css"
   },
   "scripts": { "build": "tsc -p tsconfig.json", "typecheck": "tsc -p tsconfig.json --noEmit", "test": "node --import tsx --test \"src/**/*.test.ts\"" },

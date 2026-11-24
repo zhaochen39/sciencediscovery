@@ -27,6 +27,7 @@ export interface TrajectoryDetail {
   context?: { input: unknown; blocks: ContextBlock[]; assembly: unknown; state: unknown };
 }
 export interface TrajectoryPort {
+  scope?: import("./scope-contract.js").ScopePort;
   index(sessionId: string, signal: AbortSignal): Promise<TrajectoryIndex>;
   detail(sessionId: string, id: string, signal: AbortSignal): Promise<TrajectoryDetail>;
   export(sessionId: string, signal: AbortSignal): Promise<Blob>;

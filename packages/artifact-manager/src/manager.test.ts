@@ -29,6 +29,10 @@ test("registerWorkspaceArtifact classifies and persists through domain ports", a
   assert.equal(saved?.forceNewVersion, undefined, "a normal publish leaves the new-version override off");
   await manager.registerWorkspaceArtifact({ forceNewVersion: true, path: "reports/final.md", sessionId: "s", workspaceRoot: "/w" });
   assert.equal(saved?.forceNewVersion, true, "an annotation-only republish can request a new number");
+  saved = undefined;
+  await assert.rejects(manager.registerWorkspaceArtifact({ expectedContentHash: "b".repeat(64),
+    path: "reports/final.md", sessionId: "s", workspaceRoot: "/w" }), /changed before publication/);
+  assert.equal(saved, undefined, "changed bytes may not be cataloged as verified");
 });
 
 test("artifactMediaType has a conservative binary fallback", () => {

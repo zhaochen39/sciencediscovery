@@ -276,8 +276,11 @@ export async function main(args=process.argv.slice(2)) {
   let plan=createPlan(catalog,{revision,selector:selector||'',targets,execution,...(dimensions.length?{}:{profile:profileName})});
   if(needPW){
     // Pin the evaluator/input implementation independently of the candidate
-    // product SHA so stored scores identify their judge/rubric version.
-    const sources=[...globSync(['test/benchmarks/**/*.py','test/benchmarks/**/*.json','test/benchmarks/**/*.ts','test/benchmarks/**/*.mjs','test/helpers/*result.mjs','test/helpers/real-delivery.*','test/biomnibench-da-swarm.spec.ts','.ci/biomni-gate.mjs'],{cwd:root})].sort();
+    // product SHA so stored scores identify their judge/rubric version. Runtime
+    // artifacts under benchmark logs are never evaluator inputs.
+    const sources=[...globSync(['test/benchmarks/**/*.py','test/benchmarks/**/*.json','test/benchmarks/**/*.ts','test/benchmarks/**/*.mjs','test/helpers/*result.mjs','test/helpers/real-delivery.*','test/biomnibench-da-swarm.spec.ts','.ci/biomni-gate.mjs'], {
+      cwd: root, exclude: ['**/logs', '**/node_modules', '**/.tmp'],
+    })].sort();
     const evaluatorRevision=fileDigest(sources.map(p=>p+'\n'+fileDigest(readFileSync(join(root,p)))).join('\n'));
     plan=subplan({...plan,evaluatorRevision},plan.entries);
   }

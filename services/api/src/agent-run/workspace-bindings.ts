@@ -689,6 +689,7 @@ export function createWorkspaceExecutionBindings(
       start: async (code, environment, signal, toolCallId, runnerId) => {
         const prepared = await prepareShell(code, "ephemeral", signal, toolCallId, runnerId, environment);
         const workspaceId = options.store.workspaceIdentity(options.sessionId, options.agentId, prepared.runnerId).id;
+        signal?.throwIfAborted();
         return delivered(await options.store.shellExecutions.start(executionOwner, {
           runnerId: prepared.runnerId!, turnId: options.executionId,
           workspaceId,

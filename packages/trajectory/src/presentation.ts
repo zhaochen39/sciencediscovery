@@ -79,8 +79,21 @@ export function entryTitle(entry: TrajectoryEntry, zh: boolean): string {
     "state.committed": ["状态检查点", "State checkpoint"], context_recovery: ["上下文超限恢复", "Context overflow recovery"],
     tool_execution_start: ["工具调用", "Tool invocation"], tool_execution_end: ["工具结果", "Tool result"],
     "tool.started": ["工具调用", "Tool invocation"], "tool.completed": ["工具结果", "Tool result"],
+    "research.recovery": ["科研检查点续跑", "Research checkpoint recovery"],
     "tool.output": ["命令输出", "Command output"], "mcp.invocation": ["MCP 调用", "MCP invocation"],
   };
+  if (type === "research.recovery") {
+    const actions: Record<string, [string, string]> = {
+      "full-history": ["使用完整历史", "Use full history"],
+      "retained-evidence": ["保留原始证据", "Retain original evidence"],
+      "evidence-retired": ["退出原始证据", "Retire original evidence"],
+      "evidence-restored": ["恢复原始证据", "Restore original evidence"],
+      "delivery-verified": ["科研产物复算通过", "Research delivery verified"],
+      "shell-stop-confirmed": ["Shell 已停止", "Shell stop confirmed"],
+      "shell-stop-unconfirmed": ["Shell 停止待确认", "Shell stop unconfirmed"],
+    };
+    return (actions[entry.label] ?? titles[type]!)[zh ? 0 : 1];
+  }
   if (type === "state_changed") return ({ failed: zh ? "执行失败" : "Run failed", cancelled: zh ? "执行取消" : "Run cancelled", waiting_external: zh ? "等待外部操作" : "Waiting for external action" })[entry.status ?? ""] ?? type;
   if (entry.kind === "thinking") return zh ? "思考内容" : "Thinking";
   if (titles[type]) return titles[type][zh ? 0 : 1];

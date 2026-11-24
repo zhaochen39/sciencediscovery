@@ -270,6 +270,8 @@ export const MODEL_RESPONSE_ID_HEADER = "x-sciencediscovery-response-id";
 
 /** Run control is independent of optional, best-effort trajectory logging. */
 export interface ModelGatewayLifecycle {
+  /** Project the model-visible task transcript before trajectory recording or dispatch. */
+  projectHistory?: (history: HistoryMessage[]) => Promise<HistoryMessage[]>;
   progress(): void;
   /** Original provider usage, before Swarm can replace unreported fields with zero. Task calls only. */
   onUsage?(usage: ModelUsage | undefined): void;
@@ -394,7 +396,8 @@ export async function startModelGateway(
         error instanceof GatewayRejection ? error.code : undefined);
       return;
     }
-    const { history, systemPrompt, tools } = translated;
+    let { history } = translated;
+    const { systemPrompt, tools } = translated;
     const housekeeping = request.headers["x-sciencediscovery-model-purpose"] === "housekeeping";
     const auxiliary = housekeeping || isSwarmCompaction(body);
     // The legacy default-model route selects the latest active endpoint, not
@@ -522,6 +525,13 @@ export async function startModelGateway(
       controller.signal.throwIfAborted();
     };
     const prepare = async () => {
+      if (!auxiliary && lifecycle?.projectHistory) {
+        const projectedAt = Date.now();
+        history = await lifecycle.projectHistory(history);
+        if (process.env.SCIENCE_AGENT_TRACE_MODEL_STREAM === "1") {
+          console.info(`[model-stream] ${JSON.stringify({ id, phase: "history_projection", projectionMs: Date.now() - projectedAt })}`);
+        }
+      }
       // The identity goes with the input, so the trajectory binds it to the turn this call opens
       // rather than to a field a later call could overwrite.
       if (observed) await observe("input", () => observed.request({ history, systemPrompt, tools, ...(call ? { call } : {}) }));
@@ -603,7 +613,7 @@ export async function startModelGateway(
         controller.signal.throwIfAborted();
         const visible = { text: false };
         const turn = await streamTurn((attempt) => ({
-          onProgress: () => { upstream(); trace("receive"); },
+          onProgress: () => { upstream(); trace(upstreamChunks === 1 ? "first_upstream_chunk" : "receive", upstreamChunks === 1); },
           onTextDelta: (delta) => { if (delta.length > 0) visible.text = true; writeDelta({ content: delta }); },
           onThinkingDelta: (delta) => { if (attempt === 0) writeDelta({ reasoning_content: delta }); },
           onToolCallDelta: (delta) => {

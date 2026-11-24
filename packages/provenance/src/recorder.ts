@@ -328,6 +328,7 @@ export class ProvenanceRecorder {
   }
 
   async registerWorkspaceArtifact(options: {
+    expectedContentHash?: string;
     artifactId?: string;
     baseVersionId?: string;
     publicationId?: string;
@@ -350,6 +351,7 @@ export class ProvenanceRecorder {
     workspaceRoot: string;
   }): Promise<{ artifact: ScientificArtifact; version: ScientificArtifactVersion }> {
     const registered = await this.artifactRegistry.registerWorkspaceArtifact({
+      expectedContentHash: options.expectedContentHash,
       artifactId: options.artifactId, baseVersionId: options.baseVersionId, publicationId: options.publicationId,
       ...(options.forceNewVersion ? { forceNewVersion: true } : {}),
       ...(options.description ? { description: options.description } : {}),

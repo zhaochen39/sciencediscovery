@@ -45,6 +45,9 @@ importers:
       '@sciencediscovery/schema':
         specifier: workspace:*
         version: link:../../packages/schema
+      '@sciencediscovery/trajectory':
+        specifier: workspace:*
+        version: link:../../packages/trajectory
       fflate:
         specifier: ^0.8.3
         version: 0.8.3

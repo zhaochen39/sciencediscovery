@@ -120,6 +120,7 @@ test('official and local scores stay separate through publication and gating', (
 test('tokens include all invocation attempts and judge retries without double counting totals', () => {
   const invocation = { id:'1', usageStatus:'reported', inputTokens:10, outputTokens:3, totalTokens:13 };
   assert.equal(generationTokens({invocations:[invocation,{...invocation,id:'2'}]},['1']).total,13);
+  assert.equal(generationTokens({invocations:[invocation,{...invocation,id:'2',turnsRecorded:3}]}).requests,4);
   assert.throws(() => generationTokens({invocations:[{...invocation,totalTokens:null}]}), /UNREPORTED/);
   assert.throws(() => generationTokens({invocations:[invocation,invocation]}), /DUPLICATE/);
   const attempt = {usage:{prompt_tokens:10,completion_tokens:2,total_tokens:12}};

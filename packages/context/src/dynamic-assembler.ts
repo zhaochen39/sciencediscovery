@@ -33,6 +33,8 @@ import {
 } from "./token-estimator.js";
 import { ContextValidator } from "./validator.js";
 import type { StateView } from "./state-view.js";
+import type { ScopeProjectionOptions, ScopeProjectionTrace } from "./scope-projection.js";
+import { projectVerifiedStages } from "./verified-stage-projection.js";
 
 export interface DynamicRenderedContext<TMessage extends RuntimeMessage = RuntimeMessage> {
   compaction: HistoryCompactionStatistics;
@@ -46,14 +48,18 @@ export interface DynamicRenderedContext<TMessage extends RuntimeMessage = Runtim
 
 export interface DynamicContextTrace<TMessage extends RuntimeMessage = RuntimeMessage> {
   admitted?: CollectedContext<TMessage>;
+  assemblyDurationMs?: number;
+  canonicalHistoryMessageCount?: number;
   collection?: ContextCollectionReport<TMessage>;
   error?: string;
   modelInput?: ModelInput<TMessage>;
   mode: ContextAssemblyMode;
+  projection?: ScopeProjectionTrace;
+  projectionObservation?: { durationMs: number; error?: string };
   recovery?: ContextRecovery;
   rendered?: DynamicRenderedContext<TMessage>;
   turn: number;
-  used: "dynamic" | "legacy";
+  used: "dynamic" | "legacy" | "projection";
 }
 
 export interface DynamicContextAssemblerOptions<TMessage extends RuntimeMessage> {
@@ -67,6 +73,7 @@ export interface DynamicContextAssemblerOptions<TMessage extends RuntimeMessage>
   promptRenderer?: SystemPromptRenderer;
   registry: ContextContributorRegistry<TMessage>;
   scope: AgentScope;
+  scopeProjection?: ScopeProjectionOptions<TMessage>;
   systemPrompt: string;
   tokenEstimator?: TokenEstimator<TMessage>;
   tools(): WireToolSpec[];
@@ -98,6 +105,7 @@ implements ContextAssembler<TMessage, ModelInput<TMessage>> {
     signal: AbortSignal;
     turn: number;
   }): Promise<ContextAssembly<TMessage, ModelInput<TMessage>>> {
+    const started = performance.now();
     const tools = this.options.tools().map((tool) => structuredClone(tool));
     const preliminary = await this.options.compactor.compactDetailed(
       input.history,
@@ -114,9 +122,10 @@ implements ContextAssembler<TMessage, ModelInput<TMessage>> {
     let admitted: CollectedContext<TMessage> | undefined;
     let rendered: DynamicRenderedContext<TMessage> | undefined;
     try {
+      const stateView = this.options.stateView?.();
       const collect = async (visibleHistory: readonly TMessage[]) => {
         collection = await this.options.registry.collectDetailed({
-          ...(this.options.stateView ? { stateView: this.options.stateView() } : {}),
+          ...(stateView ? { stateView } : {}),
           contextId: this.options.contextId,
           history: visibleHistory,
           scope: this.options.scope,
@@ -185,6 +194,34 @@ implements ContextAssembler<TMessage, ModelInput<TMessage>> {
         reservedTokens = this.tokenEstimator.estimateSystemPrompt(prompt.systemPrompt)
           + this.tokenEstimator.estimateTools(tools);
       }
+      const observeOnly = this.options.mode === "dynamic-shadow";
+      let projection: ReturnType<typeof projectVerifiedStages<TMessage>> | undefined;
+      let projectionObservation: DynamicContextTrace<TMessage>["projectionObservation"];
+      if (this.options.mode !== "dynamic") {
+        const started = performance.now();
+        try {
+          projection = projectVerifiedStages(history, stateView, {
+            ...(this.options.scopeProjection ?? {}),
+            estimator: this.tokenEstimator,
+          });
+          if (observeOnly) projectionObservation = { durationMs: performance.now() - started };
+        } catch (error) {
+          if (!observeOnly) throw error;
+          projectionObservation = { durationMs: performance.now() - started, error: "candidate_evaluation_failed" };
+        }
+      }
+      const useProjection = projection?.trace.applied === true && !observeOnly;
+      if (useProjection && projection) {
+        collected = await collect(projection.history);
+        prompt = collected.prompt;
+        invocationContext = this.messageComposer.compose({
+          attachments: collected.admitted.attachments,
+          history: [],
+          messages: collected.admitted.messages,
+        });
+        reservedTokens = this.tokenEstimator.estimateSystemPrompt(prompt.systemPrompt)
+          + this.tokenEstimator.estimateTools(tools);
+      }
       const compaction: HistoryCompactionStatistics = {
         afterTokens: compacted.statistics.afterTokens ?? preliminary.statistics.afterTokens,
         beforeTokens: preliminary.statistics.beforeTokens,
@@ -213,7 +250,7 @@ implements ContextAssembler<TMessage, ModelInput<TMessage>> {
       legacy = { history, modelInput: { history, systemPrompt: this.options.systemPrompt, tools } };
       const invocationHistory = this.messageComposer.compose({
         attachments: collected.admitted.attachments,
-        history,
+        history: useProjection && projection ? projection.history : history,
         messages: collected.admitted.messages,
       });
       const window = this.windowPolicy.select(invocationHistory, {
@@ -257,23 +294,29 @@ implements ContextAssembler<TMessage, ModelInput<TMessage>> {
       };
       if (this.options.mode === "shadow") {
         await this.options.onTrace?.({
-          admitted, collection, mode: "shadow", modelInput: legacy.modelInput,
+          admitted, assemblyDurationMs: performance.now() - started, collection, mode: "shadow", modelInput: legacy.modelInput,
+          canonicalHistoryMessageCount: history.length,
+          projection: projection?.trace,
           recovery: input.recovery, rendered, turn: input.turn, used: "legacy",
         });
         return legacy;
       }
       await this.options.onTrace?.({
-        admitted, collection, mode: "dynamic", modelInput,
-        recovery: input.recovery, rendered, turn: input.turn, used: "dynamic",
+        admitted, assemblyDurationMs: performance.now() - started, collection, mode: this.options.mode, modelInput,
+        canonicalHistoryMessageCount: history.length,
+        projection: projection?.trace,
+        ...(projectionObservation ? { projectionObservation } : {}),
+        recovery: input.recovery, rendered, turn: input.turn, used: useProjection ? "projection" : "dynamic",
       });
       return { history, modelInput };
     } catch (error) {
       if (error instanceof ContextCollectionError) collection = error.report;
       const message = error instanceof Error ? error.message : String(error);
       await this.options.onTrace?.({
-        admitted, collection, error: message, mode: this.options.mode,
+        admitted, assemblyDurationMs: performance.now() - started, collection, error: message, mode: this.options.mode,
+        canonicalHistoryMessageCount: history.length,
         modelInput: legacy.modelInput, recovery: input.recovery, rendered, turn: input.turn,
-        used: this.options.mode === "shadow" ? "legacy" : "dynamic",
+        used: this.options.mode === "shadow" ? "legacy" : this.options.mode === "projection" ? "projection" : "dynamic",
       });
       if (this.options.mode === "shadow") return legacy;
       throw error;

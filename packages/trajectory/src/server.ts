@@ -259,7 +259,7 @@ export async function openSessionTrajectory(dataDir: string, source: SessionTraj
     // Chat projections of recorded model/tool events are not a second timeline.
     // Command output, MCP audit and product-side events retain their own entries.
     if (!event.evidence && coveredExecutions.has(`${item.agentId}:${item.runId}`) &&
-      !/^(tool\.output|mcp\.|artifact\.|workspace\.|permission\.|run\.failed|run\.cancelled)/.test(String(event.type))) continue;
+      !/^(tool\.output|mcp\.|artifact\.|workspace\.|permission\.|research\.recovery$|run\.failed|run\.cancelled)/.test(String(event.type))) continue;
     let payload: unknown = item.event, endTime = timestamp(evidence.endedAt ?? event.finishedAt);
     if (["assistant.delta", "assistant.thinking.delta", "tool.output"].includes(String(event.type))) {
       const packets = [item];
@@ -303,7 +303,7 @@ export async function openSessionTrajectory(dataDir: string, source: SessionTraj
     add({ id, agentId: item.agentId, kind: eventKind({ ...event, type: eventType }),
       eventType, ...(typeof event.state === "string" ? { status: event.state } : {}),
       ...(contextId ? { contextId } : {}),
-      label: String(event.toolId ?? trace.name ?? trace.tool ?? step.toolName ?? step.kind ?? eventType), timestamp: timestamp(evidence.recordedAt ?? item.createdAt),
+      label: String(event.toolId ?? trace.name ?? trace.tool ?? step.toolName ?? step.kind ?? (event.type === "research.recovery" ? event.action : eventType)), timestamp: timestamp(evidence.recordedAt ?? item.createdAt),
       ...(typeof evidence.turn === "number" ? { turn: evidence.turn } : {}),
       ...(typeof evidence.requestExecutionId === "string" ? { requestExecutionId: evidence.requestExecutionId } : {}),
       ...(endTime ? { endTime } : {}), runId: typeof evidence.agentRunId === "string" ? evidence.agentRunId : item.runId,

@@ -3,6 +3,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { text, type TrajectoryDetail, type TrajectoryEntry, type TrajectoryIndex, type TrajectoryKind, type TrajectoryPort } from "./index.js";
 import { entryTitle, internalEntry, recordGroups, timelineEnd, timelineRows, timelineScale, visibleKinds } from "./presentation.js";
+import { ScopeExplorer } from "./scope-explorer.js";
 import { EventContent } from "./content-view.js";
 import { InputContent } from "./input-view.js";
 
@@ -249,6 +250,7 @@ export function TrajectoryViewer({ sessionId, title, port, locale, onClose }: {
       <button onClick={() => void download()} disabled={loading || exporting || !index}>{exporting ? tr("导出中…", "Exporting…") : tr("导出 NDJSON", "Export NDJSON")}</button>
       <button onClick={onClose} aria-label={tr("返回对话", "Back to conversation")}>×</button>
     </div></header>
+    {port.scope && <ScopeExplorer key={sessionId} port={port.scope} sessionId={sessionId} locale={locale} />}
     <p className="trajectory-notice">{tr("只显示已记录的数据。导出可能包含对话、工具结果和敏感业务内容，请妥善保管。", "Recorded data only. Exports may contain conversations, tool results and sensitive business content.")}</p>
     {error && <p role="alert" className="trajectory-error">{error}</p>}
     {loading && <p role="status">{tr("正在读取轨迹…", "Loading trajectory…")}</p>}

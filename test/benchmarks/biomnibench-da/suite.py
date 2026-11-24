@@ -8,6 +8,7 @@ from the environment; no SSH hosts, credentials or operator paths are embedded.
 """
 import argparse
 import csv
+import hashlib
 import importlib.util
 import json
 import os
@@ -176,6 +177,73 @@ def run_deferred(entries, latest, history, attempt_case, persist):
     return latest
 
 
+SPINE_FLAGS = {
+    'SCIENCE_AGENT_JIUWENSWARM_SCOPE_PROJECTION': ('0', '1'),
+    'SCIENCE_AGENT_JIUWENSWARM_SCOPES': ('0', '1'),
+    'SCIENCE_AGENT_JIUWENSWARM_SCOPE_DEFAULT': ('off', 'observe'),
+    'SCIENCE_AGENT_JIUWENSWARM_SCOPE_MANUAL': ('0', '0'),
+    'SCIENCE_AGENT_JIUWENSWARM_SCOPE_FOLD_CLOSED': ('0', '0'),
+    'SCIENCE_AGENT_SCOPE_MIN_SOURCE_TOKENS': ('1500', '1500'),
+    'SCIENCE_AGENT_SCOPE_MIN_SAVINGS_TOKENS': ('1500', '1500'),
+    'SCIENCE_AGENT_SCOPE_MIN_SAVINGS_PERCENT': ('10', '10'),
+}
+
+
+def freeze_spine_arm(args, env, revision, cases):
+    flags = {name: values[args.spine_arm == 'on'] for name, values in SPINE_FLAGS.items()}
+    env.update(flags)
+    # An externally enrolled session cannot change which feature set is measured.
+    env.pop('SCIENCE_AGENT_RESEARCH_RECOVERY_SESSIONS', None)
+    config = {
+        'schema': 1, 'arm': args.spine_arm, 'flags': flags,
+        'common': {
+            'revision': revision, 'backend': args.backend, 'cases': sorted(cases),
+            'data_root': str(args.data_root), 'runtime': str(args.runtime), 'python': args.python,
+            'host': platform.node(), 'architecture': platform.machine(),
+            'idle_seconds': args.idle_seconds, 'min_free_gib': args.min_free_gib,
+            'min_free_inodes': args.min_free_inodes, 'thinking_mode': 'enabled', 'thinking_effort': 'low',
+            'budgets': {name: env.get(name) or default for name, default in {
+                'E2E_BIOMNI_RUN_TIMEOUT_MS': '10800000', 'E2E_BIOMNI_EVAL_TIMEOUT_MS': '3900000',
+                'SCIENCE_AGENT_MAX_WORKSPACE_BYTES': str(40 * 1024**3),
+            }.items()},
+            'subagents': 'task', 'generator_variant': env.get('E2E_LLM_API_VARIANT') or 'deepseek',
+            'context_window': env.get('JIUWENSWARM_CONTEXT_WINDOW_TOKENS') or 'default',
+            'generator': env.get('E2E_LLM_MODEL'), 'judge': env.get('BIOMNI_JUDGE_MODEL'),
+            'endpoint_fingerprints': {name: hashlib.sha256(env[name].rstrip('/').encode()).hexdigest()
+                for name in ('E2E_LLM_BASE_URL', 'BIOMNI_JUDGE_BASE_URL')},
+            'input_hashes': {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
+                for name in ('manifest.json', 'l5-excluded.json')},
+        },
+    }
+    path = args.results / 'spine-arm.json'
+    if path.exists():
+        if json.loads(path.read_text()) != config:
+            raise RuntimeError('Cannot resume a Spine arm with a different experiment configuration')
+    elif (args.results / 'status.jsonl').exists() or (args.results / 'cases').exists():
+        raise RuntimeError('Cannot assign a Spine arm to existing attempts of unknown configuration')
+    else:
+        write_json(path, config)
+
+
+def projection_evidence(attempt):
+    logs = sorted(attempt.rglob('stack.log'))
+    events = set()
+    for log in logs:
+        with log.open(errors='replace') as stream:
+            for line in stream:
+                marker = '[swarm-spine] '
+                if marker not in line:
+                    continue
+                try:
+                    event = json.loads(line.split(marker, 1)[1])
+                except ValueError:
+                    continue
+                if event.get('event') == 'scope.projection.applied':
+                    events.add((event['runId'], event['turn']))
+    return {'stack_logs': len(logs), 'applied_turns': len(events),
+            'applied_runs': len({run for run, _ in events})}
+
+
 def run_case(args, env, selection, entry, row, previous):
     case, phase = entry['case'], row['phase']
     attempt = args.results / 'cases' / case / phase
@@ -191,6 +259,8 @@ def run_case(args, env, selection, entry, row, previous):
         BIOMNI_PYTHON=args.python, BIOMNI_JUDGE_MAX_RETRIES='0')
     evidence = recoverable_evidence(args.results / 'cases' / case, case) if previous else None
     row['mode'] = 'evaluation-only' if evidence else 'end-to-end'
+    if evidence:
+        row['generation_metrics_path'] = str(evidence / 'benchmark-metrics.json')
     try:
         check_resources(args.results, 5 * 1024**3, 10000)
         if evidence:
@@ -211,6 +281,8 @@ def run_case(args, env, selection, entry, row, previous):
                 code = execute(['node', 'test/support/tagged/shared.mjs', 'run', *selection,
                     '--shard', entry['shard']], attempt / 'driver.log', case_env, runtime, attempt,
                     15000, args.idle_seconds)
+        if getattr(args, 'spine_arm', None) and not evidence:
+            row['projection'] = projection_evidence(attempt)
         metric_files = list(attempt.glob('**/benchmark-metrics.json'))
         doc = json.loads(metric_files[0].read_text()) if len(metric_files) == 1 else {}
         evaluation = doc.get('evaluation', {})
@@ -280,12 +352,22 @@ def main():
     parser.add_argument('--data-root', type=Path, required=True)
     parser.add_argument('--python', default=sys.executable)
     parser.add_argument('--backend', choices=['jiuwenswarm', 'legacy'], default='jiuwenswarm')
+    parser.add_argument('--spine-arm', choices=['off', 'on'])
+    parser.add_argument('--preflight-only', action='store_true', help='Freeze and verify the plan without running cases')
     parser.add_argument('--idle-seconds', type=int, default=1200)
     parser.add_argument('--min-free-gib', type=int, default=64)
     parser.add_argument('--min-free-inodes', type=int, default=150000)
     args = parser.parse_args()
     if platform.system() != 'Linux' or os.environ.get('CI_ALLOW_REAL') != '1':
         parser.error('Linux and explicit CI_ALLOW_REAL=1 are required')
+    if args.spine_arm:
+        if args.backend != 'jiuwenswarm':
+            parser.error('--spine-arm requires the jiuwenswarm backend')
+        required = ('E2E_LLM_MODEL', 'E2E_LLM_BASE_URL', 'E2E_LLM_TOKEN',
+                    'BIOMNI_JUDGE_MODEL', 'BIOMNI_JUDGE_BASE_URL', 'BIOMNI_JUDGE_API_KEY')
+        missing = [name for name in required if not os.environ.get(name, '').strip()]
+        if missing:
+            parser.error('Missing benchmark configuration: ' + ', '.join(missing))
     args.results, args.runtime, args.data_root = [p.resolve() for p in (args.results, args.runtime, args.data_root)]
     if args.runtime == args.results or args.runtime in args.results.parents or args.results in args.runtime.parents:
         parser.error('Results and runtime must be separate, non-nested directories')
@@ -299,7 +381,11 @@ def main():
     env = dict(os.environ, CI_E2E_PREPARED='1',
                E2E_LLM_THINKING_MODE='enabled', E2E_LLM_THINKING_EFFORT='low',
                BIOMNI_JUDGE_THINKING_MODE='enabled', BIOMNI_JUDGE_THINKING_EFFORT='low')
-    if env.get('BIOMNI_JUDGE_MODEL'):
+    if args.spine_arm:
+        # The tagged plan and the rubric worker must identify the same judge.
+        env.update(E2E_JUDGE_MODEL=env['BIOMNI_JUDGE_MODEL'], E2E_JUDGE_BASE_URL=env['BIOMNI_JUDGE_BASE_URL'],
+                   E2E_JUDGE_TOKEN=env['BIOMNI_JUDGE_API_KEY'])
+    elif env.get('BIOMNI_JUDGE_MODEL'):
         env.setdefault('E2E_JUDGE_MODEL', env['BIOMNI_JUDGE_MODEL'])
     revision = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=REPOSITORY, text=True).strip()
     plan_dir = args.results / 'plan'
@@ -328,6 +414,19 @@ def main():
         entries.append({'case': case, 'key': e['key'], 'shard': 'research-' + str(research.index(e) + 1)})
     if sorted(e['case'] for e in entries) != sorted(t['id'] for t in active_tasks):
         raise RuntimeError('Exactly the active pinned L5 cases are required')
+    if args.spine_arm:
+        execution = plan['execution']
+        if (execution.get('backend'), execution.get('model'), execution.get('judge')) != (
+                args.backend, env['E2E_LLM_MODEL'], env['BIOMNI_JUDGE_MODEL']):
+            raise RuntimeError('Frozen plan backend or models do not match the requested Spine arm')
+        freeze_spine_arm(args, env, revision, (entry['case'] for entry in entries))
+    elif (args.results / 'spine-arm.json').exists():
+        parser.error('Resume this suite with its original --spine-arm')
+    if args.preflight_only:
+        check_resources(args.runtime, args.min_free_gib * 1024**3, args.min_free_inodes)
+        check_resources(args.results, 5 * 1024**3, 10000)
+        print(f'Preflight passed: {len(entries)} cases, {args.backend}, revision {revision}, arm {args.spine_arm}')
+        return 0
     status = args.results / 'status.jsonl'
     latest = {}
     if status.exists():

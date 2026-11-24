@@ -125,6 +125,19 @@ export interface NativeAgentOptions extends WorkspaceAgentOptions {
   runIdleTimeoutMs?: number;
   /** Canonical wire-format transcript handed off by a preceding AgentRun. */
   gatewayHistory?: AgentHistoryMessage[];
+  /** Internal run composition seam applied before context assembly and compaction. */
+  projectContextHistory?: (history: readonly AgentHistoryMessage[], turn: number) =>
+    readonly AgentHistoryMessage[] | Promise<readonly AgentHistoryMessage[]>;
+  /** Sealed prefix for explicit research recovery at the Swarm model boundary. */
+  swarmRecoveryHistory?: readonly AgentHistoryMessage[];
+  researchScope?: {
+    tool: AgentTool;
+    context: () => { sequence: number; text: string } | undefined;
+    closedShellEvidence?: () => ReadonlyMap<string, {
+      nodeId: string; executionId: string; findings: string[]; obligations: string[];
+      artifacts: { id: string; hash: string; path: string }[];
+    }>;
+  };
   /** Runtime-pinned request/task contract preserved outside compactable history. */
   runContract?: string;
   /** Internal composition seam; production defaults to SCIENCE_AGENT_CONTEXT_MODE. */
@@ -296,6 +309,7 @@ export function createToolRegistry(
   const toolOutputSettings = resolveToolOutputSettings();
   return new ToolRegistry([
     ...executionTools, ...plugins.contributions.flatMap((item) => item.tools),
+    ...(options.researchScope ? [options.researchScope.tool] : []),
     ...createToolOutputTools(toolOutputStore, {
       tracker: new ToolOutputReadTracker(toolOutputSettings.readPolicy),
     }),
@@ -605,6 +619,19 @@ class NativeAgent implements NativeAgentHandle {
           compactor,
           contextId: this.contextId,
           mode: contextMode,
+          ...(contextMode === "shadow" || contextMode === "dynamic-shadow" || contextMode === "projection" ? {
+            scopeProjection: {
+              diagnostics: traceWriter !== undefined,
+              maxMemoryCharacters: Number(process.env.SCIENCE_AGENT_SCOPE_MEMORY_CHARS ?? 6_000),
+              retainRecentMessages: Number(process.env.SCIENCE_AGENT_SCOPE_RETAIN_MESSAGES ?? 6),
+              minSourceTokensForProjection: Number(process.env.SCIENCE_AGENT_SCOPE_MIN_SOURCE_TOKENS ?? 1_500),
+              minEstimatedSavingsTokens: Number(process.env.SCIENCE_AGENT_SCOPE_MIN_SAVINGS_TOKENS ?? 1_500),
+              minEstimatedSavingsPercent: Number(process.env.SCIENCE_AGENT_SCOPE_MIN_SAVINGS_PERCENT ?? 10),
+              maxFacts: Number(process.env.SCIENCE_AGENT_SCOPE_MAX_FACTS ?? 8),
+              maxObligations: Number(process.env.SCIENCE_AGENT_SCOPE_MAX_OBLIGATIONS ?? 5),
+              nodeId: contextScope,
+            },
+          } : {}),
           onTrace: async (trace) => {
             const planProgress = trace.admitted?.diagnostics
               .find((diagnostic) => diagnostic.code === "PLAN_PROGRESS_OBSERVATION")?.details;
@@ -620,7 +647,17 @@ class NativeAgent implements NativeAgentHandle {
               sectionCount: trace.admitted?.sections.length ?? 0,
               turn: trace.turn,
               used: trace.used,
+              ...(trace.projectionObservation ? { projectionObservation: trace.projectionObservation } : {}),
               ...(planProgress ? { planProgress } : {}),
+              ...(trace.projection ? {
+                projectionAfterTokens: trace.projection.projectedTokens,
+                projectionBeforeTokens: trace.projection.sourceTokens,
+                projectionRemovedMessages: trace.projection.removedMessageCount,
+                projectionNodeId: trace.projection.nodeId,
+              } : {}),
+              ...(trace.canonicalHistoryMessageCount !== undefined
+                ? { canonicalHistoryMessageCount: trace.canonicalHistoryMessageCount }
+                : {}),
               ...(trace.rendered ? {
                 compactionAfterTokens: trace.rendered.compaction.afterTokens,
                 compactionBeforeTokens: trace.rendered.compaction.beforeTokens,
@@ -639,8 +676,14 @@ class NativeAgent implements NativeAgentHandle {
             });
             await writeTrace(trace.turn, {
               admitted: trace.admitted,
+              assemblyDurationMs: trace.assemblyDurationMs,
               collection: trace.collection,
               contextConfig: { budget: contextBudget, mode: trace.mode, scope: contextScope },
+              ...(trace.projection ? { projection: trace.projection } : {}),
+              ...(trace.projectionObservation ? { projectionObservation: trace.projectionObservation } : {}),
+              ...(trace.canonicalHistoryMessageCount !== undefined
+                ? { canonicalHistoryMessageCount: trace.canonicalHistoryMessageCount }
+                : {}),
               ...(trace.error ? { error: trace.error } : {}),
               llmInput: trace.modelInput,
               ...(planProgress ? { planProgress } : {}),
@@ -698,7 +741,9 @@ class NativeAgent implements NativeAgentHandle {
               this.inputStateTurn = input.turn;
             }
             await this.versionRecorder?.captureInputState(this.inputState, input.turn, [...input.history]);
-            return contextAssembler.assemble({ ...input, history: projectConfigurationHistory(input.history) });
+            const history = this.options.projectContextHistory
+              ? await this.options.projectContextHistory(input.history, input.turn) : input.history;
+            return contextAssembler.assemble({ ...input, history: projectConfigurationHistory(history) });
           },
         },
         modelClient: {

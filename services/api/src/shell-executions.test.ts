@@ -1635,3 +1635,37 @@ test("context recovery uses committed exit status once and never invokes legacy 
     assert.equal(lost.submissions(), 1);
   }
 });
+
+
+test("research stop only clears the original Run with matching Runner termination evidence", async (context) => {
+  const f = await fixture(context);
+  const turnId = "checkpoint-run";
+  const receipt = { runnerInstanceId: "original-ledger", runnerBootId: "boot", revision: 1,
+    requestDigest: "sha256:request", acceptedAt: "2026-11-26T00:00:00.000Z" } as const;
+  const owned = { ...owner, id: "checkpoint-shell", turnId, runnerId: "local", workspaceId: "workspace",
+    state: "unknown", provenance: "unconfirmed", accepted: true, dispatchPhase: "accepted", finalization: "pending",
+    queuedAt: receipt.acceptedAt, expectedRunnerInstanceId: receipt.runnerInstanceId, receipt };
+  const insert = f.db.prepare("INSERT INTO shell_executions VALUES (?, ?, ?, ?)");
+  for (const record of [owned, { ...owned, id: "another-run-shell", turnId: "another-run" },
+    { ...owned, id: "another-agent-shell", agentId: "subagent:child" }]) {
+    insert.run(record.id, record.sessionId, record.agentId, JSON.stringify(record));
+  }
+  let reply: "unreachable" | "wrong-ledger" | "complete" = "unreachable";
+  const calls: string[] = [];
+  const runner = { cancelShellExecution: async (id: string) => {
+    calls.push(id);
+    if (reply === "unreachable") throw new Error("Runner unavailable");
+    const runnerInstanceId = reply === "wrong-ledger" ? "replacement-ledger" : receipt.runnerInstanceId;
+    return { ...owner, id, state: "completed", receipt: { ...receipt, runnerInstanceId },
+      evidence: { runnerInstanceId, runnerBootId: receipt.runnerBootId, revision: receipt.revision,
+        processTerminated: true, terminationReason: "exited" } };
+  } } as unknown as RunnerClient;
+  assert.equal(f.service.researchRunHasOutstandingShell(owner.sessionId, turnId), true);
+  assert.deepEqual(await f.service.stopResearchRun(owner.sessionId, turnId, runner), [owned.id]);
+  reply = "wrong-ledger";
+  assert.deepEqual(await f.service.stopResearchRun(owner.sessionId, turnId, runner), [owned.id]);
+  reply = "complete";
+  assert.deepEqual(await f.service.stopResearchRun(owner.sessionId, turnId, runner), []);
+  assert.deepEqual(calls, [owned.id, owned.id, owned.id]);
+  assert.equal(f.service.find(owned.id, owner).state, "unknown", "stop must not forge provenance publication");
+});

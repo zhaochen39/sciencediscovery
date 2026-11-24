@@ -13,6 +13,7 @@
     "@sciencediscovery/account-session": "workspace:*",
     "@sciencediscovery/operational-logging": "workspace:*",
     "@sciencediscovery/schema": "workspace:*",
+    "@sciencediscovery/trajectory": "workspace:*",
     "fflate": "^0.8.3",
     "molstar": "^5.11.0",
     "react": "19.2.7",

@@ -339,6 +339,11 @@ import {
   prepareSubagentHandoff,
   validateSubagentStructuredResult,
 } from "../subagents/index.js";
+import { scopeEvolveResult } from "../runs/scope-research-result.js";
+import { scopeMemorySubgraph } from "../runs/scope-memory-graph.js";
+import { ScopeConflict, ScopeLedger } from "../runs/scope-ledger.js";
+import { readResearchNodeMemory, ResearchCheckpointError } from "../runs/research-checkpoint.js";
+import { SpawnReceiptConflict, writeSpawnReceipt } from "../subagents/spawn-receipt.js";
 import {
   messagePromptContent,
   resolveComposerReferences,
@@ -363,6 +368,7 @@ import { handleCustomMcpRequest, handleMcpOAuthCallback } from "./custom-mcp.js"
 import { contentTypeForPath, serveStatic } from "./static.js";
 import {
   cancelCurrentSessionRun,
+  ensureResearchWorkspaceQuiescent,
   cancelSessionRun,
   stopSessionSubagent,
   createSkillEvolutionRun,
@@ -4050,6 +4056,7 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
           maxWorkspaceBytes: quotas.runnerMaxWorkspaceBytes,
         };
         const parts = await readMultipartUploads(request, uploadLimits.maxRequestBytes);
+        await ensureResearchWorkspaceQuiescent(store, runnerClient, sessionId);
         const result: WorkspaceUploadResult = await withWorkspaceMutation(new VersionStore(store.dataDir), store.workspacePath(sessionId), () => uploadWorkspaceParts({
           conflict,
           limits: uploadLimits,
@@ -4086,6 +4093,59 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
         }
         sendJson(response, 201, result);
         return;
+      }
+
+      const scopesMatch = /^\/api\/sessions\/([^/]+)\/research-scopes$/u.exec(url.pathname);
+      if (scopesMatch && request.method === "GET") {
+        const sessionId = decodeURIComponent(scopesMatch[1]!);
+        if (!store.getSession(sessionId)) return sendError(response, 404, "Session not found");
+        response.setHeader("Cache-Control", "no-store");
+        const versionId = url.searchParams.get("versionId");
+        if (versionId !== null) {
+          if (!store.getArtifactVersion(sessionId, versionId)) return sendError(response, 404, "Artifact Version not found");
+          return sendJson(response, 200, new ScopeLedger(store.getConfigurationDatabase(), config.dataDir, sessionId, "").artifactScopes(versionId));
+        }
+        const runId = url.searchParams.get("runId");
+        const nodeId = url.searchParams.get("nodeId");
+        const executionId = url.searchParams.get("executionId");
+        if ((nodeId !== null || executionId !== null) && runId === null) return sendError(response, 400, "A Scope Memory lookup requires a Run");
+        const scopedRuns = (await store.listSessionRuns(sessionId)).filter(run => run.researchScopes);
+        if (runId !== null && !scopedRuns.some(run => run.id === runId)) return sendError(response, 404, "Scoped Run not found");
+        const ledgerFor = (id: string) => new ScopeLedger(store.getConfigurationDatabase(), config.dataDir, sessionId, id);
+        try {
+          if (nodeId !== null && runId !== null) return sendJson(response, 200, await ledgerFor(runId).readMemory(nodeId));
+          if (runId === null) return sendJson(response, 200, scopedRuns.slice(-40).reverse().map(run => ({ runId: run.id, status: run.status, createdAt: run.createdAt })));
+          const run = scopedRuns.find(item => item.id === runId)!;
+          const ledger = ledgerFor(runId);
+          if (executionId !== null) {
+            const execution = ledger.executions().find(item => item.toolCallId === executionId);
+            if (!execution?.reference || execution.status !== "completed") return sendError(response, 404, "Linked research execution not found");
+            if (execution.tool === "create_evolve_run") {
+              const search = await evolutionStore.readRun(execution.reference);
+              if (!search || search.sessionId !== sessionId) return sendError(response, 404, "Search not found");
+              return sendJson(response, 200, scopeEvolveResult(search, await evolutionStore.readEvents(search.id)));
+            }
+            if (execution.tool === "create_idea_research") return sendJson(response, 200, await ideaResearch.summary(sessionId, execution.reference));
+            return sendError(response, 404, "Research execution summary unavailable");
+          }
+          const view = ledger.view();
+          const pendingShell = view.executions.filter(item => item.tool === "run_shell" && item.status === "running" && item.reference);
+          if (pendingShell.length) {
+            const shells = new Map(store.shellExecutions.snapshot(sessionId).filter(item => item.turnId === runId).map(item => [item.id, item.state]));
+            for (const item of pendingShell) {
+              const state = shells.get(item.reference!);
+              if (state === "completed" || state === "failed" || state === "cancelled") {
+                item.status = state;
+                const node = view.nodes.find(node => node.id === item.nodeId && node.id.startsWith("observed:"));
+                if (node) node.status = state === "completed" ? "completed" : "failed";
+              }
+            }
+          }
+          return sendJson(response, 200, { runId, status: run.status, createdAt: run.createdAt, ...view });
+        } catch (error) {
+          if (error instanceof ScopeConflict) return sendError(response, 409, error.message);
+          throw error;
+        }
       }
 
       const trajectoryMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/trajectory(?:\/(detail|export))?$/);
@@ -4165,6 +4225,38 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
         if (!run) return sendError(response, 404, "Run not found");
         sendJson(response, 200, run);
         return;
+      }
+
+      const nodeMemoryMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/runs\/([^/]+)\/node-memory$/u);
+      if (nodeMemoryMatch && request.method === "GET") {
+        const versionId = url.searchParams.get("versionId");
+        if (!versionId) return sendError(response, 400, "Node Memory requires an Artifact Version ID");
+        try {
+          const memory = await readResearchNodeMemory(store, nodeMemoryMatch[1]!, nodeMemoryMatch[2]!, versionId);
+          return sendJson(response, 200, memory, { "Cache-Control": "no-store" });
+        } catch (error) {
+          if (error instanceof ResearchCheckpointError || (error as NodeJS.ErrnoException)?.code === "ENOENT") return sendError(response, 409, "Node Memory evidence is unavailable or stale");
+          throw error;
+        }
+      }
+
+      const spawnReceiptMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/runs\/([^/]+)\/spawn-receipt$/u);
+      if (spawnReceiptMatch && request.method === "POST") {
+        const [, sessionId, runId] = spawnReceiptMatch;
+        const run = await store.getSessionRun(sessionId!, runId!);
+        if (!run) return sendError(response, 404, "Run not found");
+        if (!run.finishedAt || run.status === "queued" || run.status === "running") {
+          return sendError(response, 409, "Spawn Receipt requires a terminal Run");
+        }
+        const children = store.listSubagents(sessionId!).filter(child => child.parentTurnId === runId);
+        try {
+          const swarm = run.researchScopes ? new ScopeLedger(store.getConfigurationDatabase(), config.dataDir, sessionId!, runId!).swarmBranches() : [];
+          const receipt = await writeSpawnReceipt(config.dataDir, sessionId!, runId!, children, swarm);
+          return sendJson(response, 200, receipt);
+        } catch (error) {
+          if (error instanceof SpawnReceiptConflict || error instanceof ScopeConflict) return sendError(response, 409, error.message);
+          throw error;
+        }
       }
 
       const searchGraphMatch = url.pathname.match(/^\/api\/memory\/search-graph\/([^/]+)$/);
@@ -4408,13 +4500,14 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
         if (!store.getArtifactVersion(artifactVersionProvenanceMatch[1]!, artifactVersionProvenanceMatch[2]!)) {
           return sendError(response, 404, "Artifact version not found");
         }
-        sendJson(response, 200, await artifactVersionProvenance(
-          store,
-          provenanceRecorder,
-          memoryGraphClient,
-          artifactVersionProvenanceMatch[1]!,
-          artifactVersionProvenanceMatch[2]!,
-        ));
+        const sessionId = artifactVersionProvenanceMatch[1]!;
+        const versionId = artifactVersionProvenanceMatch[2]!;
+        const provenance = await artifactVersionProvenance(store, provenanceRecorder, memoryGraphClient, sessionId, versionId);
+        if (url.searchParams.get("includeScopes") === "1") {
+          const ledger = new ScopeLedger(store.getConfigurationDatabase(), config.dataDir, sessionId, "");
+          return sendJson(response, 200, { ...provenance, researchScopes: ledger.artifactScopes(versionId) });
+        }
+        sendJson(response, 200, provenance);
         return;
       }
       const artifactVersionDiffMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/artifact-versions\/([^/]+)\/diff$/);
@@ -4551,6 +4644,12 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
               return { nodes: [], edges: [], total: 0, truncated: false, reason: "memory_graph_unreachable" as const };
             })
           : { nodes: [], edges: [], total: 0, truncated: false, reason: "memory_graph_disabled" as const };
+        const scopeRunId = url.searchParams.get("scope_run_id");
+        if (scopeRunId !== null) {
+          if (!(await store.getSessionRun(sid, scopeRunId))?.researchScopes) return sendError(response, 404, "Scoped Run not found");
+          const ledger = new ScopeLedger(store.getConfigurationDatabase(), config.dataDir, sid, scopeRunId);
+          return sendJson(response, 200, scopeMemorySubgraph(subgraph, ledger, id => store.getArtifactVersion(sid, id)));
+        }
         sendJson(response, 200, subgraph);
         return;
       }
@@ -4880,6 +4979,7 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
           );
         }
         if (Buffer.byteLength(body.content ?? "") > 1_000_000) return sendError(response, 413, "File exceeds 1 MB");
+        await ensureResearchWorkspaceQuiescent(store, runnerClient, filesMatch[1]!);
         await withWorkspaceMutation(new VersionStore(store.dataDir), workspaceRoot, async () => {
           await mkdir(dirname(target), { recursive: true });
           await writeFile(target, body.content ?? "", "utf8");

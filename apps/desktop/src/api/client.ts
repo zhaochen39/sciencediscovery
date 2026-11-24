@@ -1,3 +1,4 @@
+import { createScopePort, type ScopePort } from "@sciencediscovery/trajectory/scope";
 // Copyright (C) 2026-2026 Huawei Technologies Co., Ltd
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -60,6 +61,7 @@ export function isAbortError(reason: unknown): boolean {
  * extractable into a shared package later.
  */
 export class ApiClient {
+  readonly scopes: ScopePort = createScopePort((path, signal) => this.request(path, { signal }));
   constructor(
     readonly token: string,
     private readonly onAuthFailure?: () => void,

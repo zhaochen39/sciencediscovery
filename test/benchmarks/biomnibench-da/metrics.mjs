@@ -8,11 +8,13 @@ const count = value => Number.isSafeInteger(value) && value >= 0;
 export function generationTokens(usage, beforeIds = []) {
   if (!Array.isArray(usage?.invocations)) throw new Error('MISSING_TOKEN_LEDGER');
   const before = new Set(beforeIds), seen = new Set();
-  const totals = { input: 0, output: 0, total: 0, invocations: 0 };
+  const totals = { input: 0, output: 0, total: 0, invocations: 0, requests: 0 };
   for (const entry of usage.invocations.filter(e => !before.has(e.id))) {
     if (!entry.id || seen.has(entry.id)) throw new Error('DUPLICATE_TOKEN_INVOCATION');
     seen.add(entry.id);
     if (entry.usageStatus !== 'reported' || ![entry.inputTokens, entry.outputTokens, entry.totalTokens].every(count)) throw new Error('UNREPORTED_GENERATION_TOKENS');
+    // A Swarm ledger entry can aggregate several model turns for one Run.
+    totals.requests += entry.turnsRecorded ?? 1;
     totals.input += entry.inputTokens; totals.output += entry.outputTokens; totals.total += entry.totalTokens; totals.invocations++;
   }
   if (!totals.invocations || !totals.total) throw new Error('EMPTY_GENERATION_TOKENS');

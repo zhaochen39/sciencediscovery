@@ -1,3 +1,5 @@
+import { ScopeExplorer } from "@sciencediscovery/trajectory/scope";
+import "@sciencediscovery/trajectory/scope.css";
 // Copyright (C) 2026-2026 Huawei Technologies Co., Ltd
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -1451,6 +1453,8 @@ export function App({ initialToken }: Props) {
             sidebarCollapsed={showExpand}
             workspaceOpen={workspaceOpen}
           />
+          {state.detail && <ScopeExplorer key={state.detail.id} sessionId={state.detail.id} port={client.scopes}
+            locale={document.documentElement.lang || "zh-CN"} onExecution={(tool, id) => tool === "create_idea_research" ? showIdeaResearch(id) : showEvolveRun(id)} />}
           {landing ? (
             /* The page's category and its open topic row belong to one
                session; the key is what ends them when the session does. */

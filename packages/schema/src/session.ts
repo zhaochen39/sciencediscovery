@@ -427,6 +427,15 @@ export type SessionRunStatus =
   | "interrupted";
 
 export interface SessionRun {
+  researchScopes?: true | "observe";
+  delegationMode?: "inline";
+  /** Server-sealed checkpoint binding. Never copied from a request. */
+  researchResume?: {
+    sourceRunId: string;
+    workflow: string;
+    mode: "full" | "by-state";
+    ref: { pool: "agent-state"; digest: `sha256:${string}`; size: number; mediaType: string };
+  };
   /** Trusted notification context, never accepted from SendMessageRequest. */
   notificationDelivery?: {
     sessionId: string; agentId: string; epoch: number; agentEpoch: number;
@@ -542,6 +551,9 @@ export type RunStreamEvent = { evidence?: AgentEventEvidence } & (
    */
   | { responseId: string; turn: number; type: "assistant.response.settled" }
   | { nodeId?: string; phase: IdeaTreePhase; treeId?: string; type: "idea_tree.phase" }
+  | { type: "research.recovery"; sourceRunId: string; workflow: string;
+      action: "full-history" | "retained-evidence" | "evidence-retired" | "evidence-restored" | "delivery-verified" | "shell-stop-confirmed" | "shell-stop-unconfirmed";
+      checkpointDigest: string; reason?: string; turn?: number }
   | { trace: ToolTrace; type: "tool.started" }
   | { trace: ToolTrace; type: "tool.completed" }
   | { chunk: string; toolCallId: string; type: "tool.output"; progress?: boolean }
@@ -648,6 +660,11 @@ export interface SessionThinkingControls {
 }
 
 export interface SendMessageRequest {
+  /** Keep Native task steps in the current Run instead of spawning subagents. */
+  delegationMode?: "inline";
+  /** Explicit continuation of the latest completed quality-stage Run. */
+  researchResume?: { sourceRunId: string; workflow: string };
+  researchScopes?: true | "observe";
   annotationIds?: string[];
   content: string;
   references?: ComposerReference[];
