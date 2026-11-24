@@ -77,10 +77,12 @@ on:
 # Keyed on the calling workflow as well as the ref: a nightly run and a push
 # run land on refs/heads/main at the same time, and without the workflow name
 # they would share a group and cancel each other. In a called workflow
-# `github.workflow` is the caller's name, so each pipeline gets its own lane.
+# `github.workflow` is the caller's name. The release profile also gets a
+# separate group by event so direct CI dispatches can coexist with branch
+# pushes, and a manual Release run on a tag can coexist with its tag push.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}${{ inputs.profile == 'package' && format('-package-{0}', inputs['package-platform'] || 'linux-windows') || '' }}
-  cancel-in-progress: true
+  group: ci-${{ inputs.profile == 'release' && format('release-{0}-', github.event_name) || '' }}${{ github.workflow }}-${{ github.ref }}${{ inputs.profile == 'package' && format('-package-{0}', inputs['package-platform'] || 'linux-windows') || '' }}
+  cancel-in-progress: ${{ inputs.profile != 'release' }}
 
 permissions:
   contents: read
