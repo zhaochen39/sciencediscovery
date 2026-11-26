@@ -84,7 +84,7 @@ export class ReviewerAuditCoordinator {
       origin: "manual",
       reviewLevel: sessionSettings.level,
       sessionId,
-    }, true);
+    });
   }
 
   async enqueueArtifactVersion(input: {
@@ -108,34 +108,31 @@ export class ReviewerAuditCoordinator {
     const reviewLevel: ReviewerSpecialistLevel = /(?:^|\/)json(?:;|$)/i.test(input.mediaType)
       ? "quick"
       : sessionSettings.level;
-    const tasks = await this.store.listReviewerAuditTasks(input.sessionId);
-    const pending = tasks.find((task) => task.origin === "artifact_registered"
-      && task.status === "queued" && !task.checkpointPublishedAt && task.sourceRunId === sourceRun?.id && task.reviewLevel === reviewLevel);
-    if (pending) {
+    const task = await this.store.upsertAutomaticReviewerAuditTask(input.sessionId, (pending, tasks) => {
+      const notBefore = this.automaticNotBefore(input.sessionId, reviewLevel, tasks);
+      if (!pending) {
+        return this.buildTask({
+          artifactVersionIds: [input.artifactVersionId],
+          checkpointMessageId: randomUUID(),
+          feedbackPolicy: READ_ONLY_FEEDBACK_POLICY,
+          origin: "artifact_registered",
+          reviewLevel,
+          sessionId: input.sessionId,
+          ...(sourceRun ? { sourceRunId: sourceRun.id } : {}),
+        }, notBefore);
+      }
       const artifactVersionIds = this.mergeLatestArtifactVersions(input.sessionId, [
         ...pending.artifactVersionIds,
         input.artifactVersionId,
       ]);
-      const notBefore = this.automaticNotBefore(input.sessionId, pending.reviewLevel, tasks);
-      const updated = await this.store.updateReviewerAuditTask(input.sessionId, pending.id, {
+      return {
+        ...pending,
         artifactVersionIds,
-        inputFingerprint: this.automaticFingerprint(artifactVersionIds, pending.feedbackPolicy, pending.reviewLevel),
+        inputFingerprint: this.automaticFingerprint(artifactVersionIds, pending.feedbackPolicy, reviewLevel),
         notBefore,
-      });
-      this.scheduleAt(input.sessionId, new Date(notBefore).getTime());
-      return updated;
-    }
-    const checkpointMessageId = randomUUID();
-    const artifactVersionIds = [input.artifactVersionId];
-    const task = await this.createTask({
-      artifactVersionIds,
-      checkpointMessageId,
-      feedbackPolicy: READ_ONLY_FEEDBACK_POLICY,
-      origin: "artifact_registered",
-      reviewLevel,
-      sessionId: input.sessionId,
-      ...(sourceRun ? { sourceRunId: sourceRun.id } : {}),
-    }, false, this.automaticNotBefore(input.sessionId, reviewLevel, tasks));
+      };
+    }, { sourceRunId: sourceRun?.id, reviewLevel });
+    if (task.status === "queued") this.scheduleAt(input.sessionId, new Date(task.notBefore ?? task.createdAt).getTime());
     return task;
   }
 
@@ -219,7 +216,16 @@ export class ReviewerAuditCoordinator {
       .map((version) => version.id);
   }
 
-  private async createTask(input: {
+  private async createTask(input: Parameters<ReviewerAuditCoordinator["buildTask"]>[0]): Promise<ReviewerAuditTask> {
+    const task = this.buildTask(input);
+    const persisted = await this.store.createReviewerAuditTask(task);
+    if (persisted.id !== task.id) return persisted;
+    await this.publishCheckpoint(task);
+    this.scheduleAt(task.sessionId, Date.now());
+    return task;
+  }
+
+  private buildTask(input: {
     sourceRunId?: string;
     artifactVersionIds: string[];
     checkpointMessageId: string;
@@ -227,7 +233,7 @@ export class ReviewerAuditCoordinator {
     origin: ReviewerAuditTask["origin"];
     reviewLevel: ReviewerSpecialistLevel;
     sessionId: string;
-  }, publishCheckpoint: boolean, notBefore?: string): Promise<ReviewerAuditTask> {
+  }, notBefore?: string): ReviewerAuditTask {
     if (!input.artifactVersionIds.length) throw new Error("No report artifacts to review");
     const now = new Date().toISOString();
     const taskId = randomUUID();
@@ -241,7 +247,7 @@ export class ReviewerAuditCoordinator {
         reviewLevel: input.reviewLevel,
         version: 1,
       });
-    const task: ReviewerAuditTask = {
+    return {
       ...(input.sourceRunId ? { sourceRunId: input.sourceRunId } : {}),
       artifactVersionIds: [...input.artifactVersionIds],
       checkpointMessageId: input.checkpointMessageId,
@@ -256,11 +262,6 @@ export class ReviewerAuditCoordinator {
       status: "queued",
       toolCallId: taskToolCallId(input.origin, taskId, input.checkpointMessageId),
     };
-    const persisted = await this.store.createReviewerAuditTask(task);
-    if (persisted.id !== task.id) return persisted;
-    if (publishCheckpoint) await this.publishCheckpoint(task);
-    this.scheduleAt(input.sessionId, notBefore ? new Date(notBefore).getTime() : Date.now());
-    return task;
   }
 
   private automaticFingerprint(
@@ -274,7 +275,7 @@ export class ReviewerAuditCoordinator {
   private automaticNotBefore(
     sessionId: string,
     reviewLevel: ReviewerSpecialistLevel,
-    tasks: ReviewerAuditTask[],
+    tasks: readonly ReviewerAuditTask[],
   ): string {
     const quietMs = reviewLevel === "deep"
       ? this.scheduling.deepBatchQuietMs ?? DEEP_BATCH_QUIET_MS

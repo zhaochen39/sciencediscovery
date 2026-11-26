@@ -30,6 +30,7 @@
 import { spawn } from "node:child_process";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 
 import type { PayloadManifest } from "./payload-manifest.js";
 import type { ServiceDefinition } from "./supervisor.js";
@@ -97,6 +98,7 @@ function runEntryPoint(
   baseEnv: NodeJS.ProcessEnv,
   moduleName: string,
   args: readonly string[],
+  signal?: AbortSignal,
 ): Promise<PythonRunResult> {
   const script = `
 import sys
@@ -106,6 +108,7 @@ sys.exit(main() or 0)
 `;
   return new Promise((resolveRun) => {
     const child = spawn(paths.pythonBinary, ["-c", script, ...args], {
+      signal,
       env: {
         ...runtimeEnv(baseEnv),
         HOME: paths.home,
@@ -119,7 +122,10 @@ sys.exit(main() or 0)
     child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
     child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
     child.on("close", (code) => resolveRun({ code, stdout, stderr }));
-    child.on("error", (error) => resolveRun({ code: 127, stdout, stderr: `${stderr}${error.message}\n` }));
+    child.on("error", (error) => {
+      stderr += `${error.message}\n`;
+      if (child.pid === undefined) resolveRun({ code: 127, stdout, stderr });
+    });
   });
 }
 
@@ -150,11 +156,14 @@ async function applyConfig(paths: JiuwenSwarmPaths): Promise<void> {
 }
 
 /** Idempotent: creates and configures the instance only if it does not exist yet. */
-export async function ensureInstance(context: JiuwenSwarmContext): Promise<JiuwenSwarmPaths> {
+export async function ensureInstance(context: JiuwenSwarmContext, signal?: AbortSignal): Promise<JiuwenSwarmPaths> {
+  signal?.throwIfAborted();
   const paths = jiuwenswarmPaths(context);
   if (await instanceExists(paths)) return paths;
+  signal?.throwIfAborted();
   context.log(`Creating the JiuwenSwarm instance ${INSTANCE_NAME}...`);
-  const init = await runEntryPoint(paths, context.baseEnv, "jiuwenswarm.init_workspace", ["--name", INSTANCE_NAME]);
+  const init = await runEntryPoint(paths, context.baseEnv, "jiuwenswarm.init_workspace", ["--name", INSTANCE_NAME], signal);
+  signal?.throwIfAborted();
   if (init.code !== 0) {
     throw new Error(`jiuwenswarm-init failed (status ${String(init.code)}):\n${init.stderr || init.stdout}`);
   }
@@ -205,20 +214,23 @@ export async function waitForGateway(
   paths: JiuwenSwarmPaths,
   baseEnv: NodeJS.ProcessEnv,
   isSettled: () => boolean,
+  signal?: AbortSignal,
 ): Promise<JiuwenSwarmEndpoints> {
   for (let attempt = 0; attempt < 90; attempt += 1) {
+    signal?.throwIfAborted();
     if (isSettled()) throw new Error("JiuwenSwarm exited before its gateway came up. See the output above.");
-    const status = await runEntryPoint(paths, baseEnv, "jiuwenswarm.start_services", ["--status", INSTANCE_NAME]);
+    const status = await runEntryPoint(paths, baseEnv, "jiuwenswarm.start_services", ["--status", INSTANCE_NAME], signal);
+    signal?.throwIfAborted();
     if (status.code === 0 && /^Status:\s*running/m.test(status.stdout)) {
       const gatewayMatch = /^\s*gateway:\s*(\d+)/m.exec(status.stdout);
       const webMatch = /^\s*web:\s*(\d+)/m.exec(status.stdout);
       if (gatewayMatch?.[1] && webMatch?.[1]) {
         // Measured in scripts/jiuwenswarm.sh: the gateway accepts connections a few seconds before the agent server does.
-        await new Promise((resolveDelay) => setTimeout(resolveDelay, 6_000));
+        await delay(6_000, undefined, { signal });
         return { gatewayPort: Number(gatewayMatch[1]), webPort: Number(webMatch[1]) };
       }
     }
-    await new Promise((resolveDelay) => setTimeout(resolveDelay, 2_000));
+    await delay(2_000, undefined, { signal });
   }
   throw new Error(`JiuwenSwarm did not report as running within 180s.`);
 }

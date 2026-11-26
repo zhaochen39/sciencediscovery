@@ -102,8 +102,13 @@ export class ResearchPackageExports {
     // same task concurrently, and a shared `.tmp` name would let one writer's
     // rename consume the other's temp file (ENOENT).
     const temporary = resolve(this.root, `${task.id}.${randomUUID()}.json.tmp`);
-    await writeFile(temporary, JSON.stringify({ ...task, outputPath: undefined }), "utf8");
-    await rename(temporary, resolve(this.root, `${task.id}.json`));
+    try {
+      await writeFile(temporary, JSON.stringify({ ...task, outputPath: undefined }), "utf8");
+      await rename(temporary, resolve(this.root, `${task.id}.json`));
+    } catch (error) {
+      await rm(temporary, { force: true }).catch(() => undefined);
+      throw error;
+    }
   }
 
   async start(options: ResearchPackageExportOptions, filename: string): Promise<ResearchPackageExportStatus> {
@@ -114,7 +119,11 @@ export class ResearchPackageExports {
     if (active >= 8) throw new Error("后台证据包导出任务较多，请稍后重试。");
     const task: StoredTask = { id, status: "queued", projectId: options.projectId, filename, createdAt: now, updatedAt: now };
     this.tasks.set(id, task);
-    await this.persist(task);
+    try { await this.persist(task); }
+    catch (error) {
+      this.tasks.delete(id);
+      throw error;
+    }
     const work = this.queue.then(() => this.run(task, structuredClone(options)));
     this.queue = work.catch(() => undefined);
     return this.publicTask(task);

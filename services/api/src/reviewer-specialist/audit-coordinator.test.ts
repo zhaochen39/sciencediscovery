@@ -6,8 +6,9 @@
 import { createTest } from "../../../../test/support/tagged/compat.mjs";
 const { test } = createTest(import.meta.url, { tags: ["category:ut", "os:linux", "arch:amd64", "arch:arm64"] });
 import assert from "node:assert/strict";
-import { mkdir, rm } from "node:fs/promises";
-import { resolve } from "node:path";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 
 
 import type { ArtifactReviewRun, ReviewerAuditTask } from "@sciencediscovery/schema";
@@ -730,4 +731,48 @@ test("automatic review records a visible skipped checkpoint when globally disabl
   assert.equal(await coordinator.enqueueArtifactVersion({
     artifactVersionId: report.version.id, contentHash: report.version.content.hash, mediaType: report.version.mediaType, sessionId: session.id,
   }), undefined, "an explicit session opt-out does not schedule a review");
+});
+
+test("concurrent registrations preserve both additions to one pending audit", async (context) => {
+  const dataDir = await mkdtemp(join(tmpdir(), "reviewer-concurrent-batch-"));
+  context.after(() => removeDataDir(dataDir));
+  const store = new SessionStore(dataDir);
+  await store.load();
+  const project = await store.createProject("Reviewer concurrent batch");
+  const session = await store.createSession(project.id, "Audit", {}, {}, { allowUnconfiguredModel: true });
+  const coordinator = new ReviewerAuditCoordinator(store, {
+    run: async () => { throw new Error("quiet window should not elapse"); },
+  }, { quickBatchQuietMs: 60_000, deepBatchQuietMs: 60_000 });
+  const addArtifact = (name: string, hash: string) => store.createArtifactVersion({
+    content: { hash: hash.repeat(64), size: 1 }, kind: "markdown", logicalName: name, mediaType: "text/markdown",
+    origin: "llm_declared", sessionId: session.id, sourcePath: name,
+  });
+  const first = await addArtifact("first.md", "a");
+  const left = await addArtifact("left.md", "b");
+  const right = await addArtifact("right.md", "c");
+  const enqueue = (artifact: typeof first) => coordinator.enqueueArtifactVersion({
+    artifactVersionId: artifact.version.id, contentHash: artifact.version.content.hash,
+    mediaType: "text/markdown", sessionId: session.id,
+  });
+  const list = store.listReviewerAuditTasks.bind(store);
+  const bothRead = Promise.withResolvers<void>();
+  let reads = 0;
+  try {
+    assert.ok(await enqueue(first));
+    // Force the old, pre-mutation reads to overlap if the coordinator uses them.
+    store.listReviewerAuditTasks = async (sessionId) => {
+      const snapshot = await list(sessionId);
+      if (++reads === 2) bothRead.resolve();
+      await bothRead.promise;
+      return snapshot;
+    };
+    await Promise.all([enqueue(left), enqueue(right)]);
+    const tasks = await list(session.id);
+    assert.equal(tasks.length, 1);
+    assert.deepEqual(new Set(tasks[0]?.artifactVersionIds), new Set([first.version.id, left.version.id, right.version.id]));
+  } finally {
+    bothRead.resolve();
+    store.listReviewerAuditTasks = list;
+    await coordinator.cancelSession(session.id);
+  }
 });

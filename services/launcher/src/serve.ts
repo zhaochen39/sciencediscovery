@@ -303,19 +303,25 @@ export async function serve(context: ServeContext, log: (message: string) => voi
   }
 
   let evolveControl: EvolveControl | undefined;
-  const evolveAbort = new AbortController();
+  const shutdownController = new AbortController();
+  const shutdownSignal = shutdownController.signal;
   const services = planServices({ ...context, credentials });
 
   const supervisor = new Supervisor({ log });
   const memorySupervisor = new Supervisor({ log });
   const runnerSupervisor = new Supervisor({ log });
   let stopping = false;
+  let shutdownWork: Promise<void> | undefined;
+  const stopServices = (): Promise<void> => shutdownWork ??= (async () => {
+    try { await supervisor.stop(); }
+    finally { await Promise.all([memorySupervisor.stop(), runnerSupervisor.stop()]); }
+  })();
   const shutdown = (signal: NodeJS.Signals): void => {
     if (stopping) return;
     stopping = true;
-    evolveAbort.abort();
+    shutdownController.abort();
     log(`\nReceived ${signal}; stopping the ScienceDiscovery stack...`);
-    void supervisor.stop().then(() => Promise.all([memorySupervisor.stop(), runnerSupervisor.stop()]));
+    void stopServices().catch(() => { /* Awaited by the serve finalizer. */ });
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
@@ -324,11 +330,12 @@ export async function serve(context: ServeContext, log: (message: string) => voi
     const [runnerService, apiService, memoryService] = services;
     if (!context.baseEnv.SCIENCE_AGENT_EVOLVE_URL?.trim()) {
       evolveControl = await startEvolveControl({ dataDir: settings.dataDir, payloadRoot: context.payloadRoot,
-        manifest, env: context.baseEnv, log, signal: evolveAbort.signal });
+        manifest, env: context.baseEnv, log, signal: shutdownSignal });
       Object.assign(apiService!.env, evolveControl.env);
     }
+    shutdownSignal.throwIfAborted();
     try {
-      await runnerSupervisor.start([runnerService!]);
+      await runnerSupervisor.start([runnerService!], shutdownSignal);
       void runnerSupervisor.waitForFirstExit().then(() => {
         if (!stopping) log("Local Runner exited; the workbench remains available. Repair or select another Runner before executing code.");
       });
@@ -337,7 +344,8 @@ export async function serve(context: ServeContext, log: (message: string) => voi
       log(`Local compute is unavailable: ${String(error)}. The workbench will continue starting.`);
     }
 
-    if (memoryService && await startMemoryGraph(memorySupervisor, memoryService, apiService!, log)) {
+    shutdownSignal.throwIfAborted();
+    if (memoryService && await startMemoryGraph(memorySupervisor, memoryService, apiService!, log, shutdownSignal)) {
       void memorySupervisor.waitForFirstExit().then(() => {
         if (!stopping) log("Memory graph exited; conversations remain available. Restart to restore the graph service.");
       });
@@ -346,6 +354,7 @@ export async function serve(context: ServeContext, log: (message: string) => voi
     // Between the runner and the API, matching scripts/start-stack.sh's
     // --jiuwenswarm order: JiuwenSwarm itself, then the adapter that fronts
     // it (health-gated), only once JiuwenSwarm reports the ports it chose.
+    shutdownSignal.throwIfAborted();
     if (settings.jiuwenswarm) {
       const paths = await ensureInstance({
         manifest,
@@ -354,18 +363,23 @@ export async function serve(context: ServeContext, log: (message: string) => voi
         baseEnv: context.baseEnv,
         pythonBinary: resolvePythonBinary(context),
         log,
-      });
-      await supervisor.start([jiuwenswarmServiceDefinition(paths, context.baseEnv)]);
-      const endpoints = await waitForGateway(paths, context.baseEnv, () => !supervisor.isRunning("JiuwenSwarm"));
+      }, shutdownSignal);
+      await supervisor.start([jiuwenswarmServiceDefinition(paths, context.baseEnv)], shutdownSignal);
+      const gatewaySignal = AbortSignal.any([shutdownSignal, supervisor.startupSignal]);
+      const endpoints = await waitForGateway(paths, context.baseEnv, () => !supervisor.isRunning("JiuwenSwarm"), gatewaySignal)
+        .catch((error: unknown) => {
+          gatewaySignal.throwIfAborted();
+          throw error;
+        });
       await supervisor.start([adapterServiceDefinition(paths, context.baseEnv, {
         publicPort: settings.port,
         legacyPort: settings.port + 100,
         host: settings.host,
         endpoints,
-      })]);
+      })], shutdownSignal);
     }
 
-    await supervisor.start([apiService!]);
+    await supervisor.start([apiService!], shutdownSignal);
 
     const host = settings.host === "0.0.0.0" || settings.host === "::" ? "127.0.0.1" : settings.host;
     const uiHost = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
@@ -395,11 +409,13 @@ export async function serve(context: ServeContext, log: (message: string) => voi
     throw error;
   } finally {
     stopping = true;
-    await supervisor.stop();
-    await memorySupervisor.stop();
-    await runnerSupervisor.stop();
-    await evolveControl?.close();
-    process.off("SIGINT", shutdown);
-    process.off("SIGTERM", shutdown);
+    try { await stopServices(); }
+    finally {
+      try { await evolveControl?.close(); }
+      finally {
+        process.off("SIGINT", shutdown);
+        process.off("SIGTERM", shutdown);
+      }
+    }
   }
 }

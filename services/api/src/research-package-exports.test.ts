@@ -1,7 +1,7 @@
 // Copyright (C) 2026-2026 Huawei Technologies Co., Ltd
 // Licensed under the Apache License, Version 2.0 (the "License");
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, rmdir, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable, type Writable } from "node:stream";
@@ -203,4 +203,26 @@ test("an export task reuses the revision observed while sizing and only re-walks
     assert.equal((await exports.get(task.id, "project"))?.status, "completed");
     assert.equal(reads, 1, "one post-write walk, with the sizing walk reused as the preflight");
   } finally { await exports.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("failed admission releases export capacity when storage recovers", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "research-exports-recovery-"));
+  const root = join(parent, "exports");
+  const exports = new ResearchPackageExports(root, async () => "r1", bytesCreated([1]));
+  try {
+    await exports.get("unused", options.projectId);
+    await rmdir(root);
+    await writeFile(root, "temporary filesystem fault");
+    for (let i = 0; i < 8; i++) {
+      await assert.rejects(exports.start(options, "research.sdresearch"), { code: /^(ENOTDIR|ENOENT)$/ });
+    }
+    await unlink(root);
+    await mkdir(root);
+    const accepted = await exports.start(options, "research.sdresearch");
+    await exports.close();
+    assert.equal((await exports.get(accepted.id, options.projectId))?.status, "completed");
+  } finally {
+    await exports.close();
+    await rm(parent, { recursive: true, force: true });
+  }
 });

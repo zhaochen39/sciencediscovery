@@ -57,13 +57,14 @@ export function planMemoryGraph(context: ServeContext): {
 
 /** Optional sidecar failure must not prevent the conversation services from starting. */
 export async function startMemoryGraph(
-  supervisor: { start(services: readonly ServiceDefinition[]): Promise<void>; stop(): Promise<void> },
+  supervisor: { start(services: readonly ServiceDefinition[], signal?: AbortSignal): Promise<void>; stop(): Promise<void> },
   service: ServiceDefinition,
   apiService: ServiceDefinition,
   log: (message: string) => void,
+  signal?: AbortSignal,
 ): Promise<boolean> {
   try {
-    await supervisor.start([service]);
+    await supervisor.start([service], signal);
     return true;
   } catch (error) {
     await supervisor.stop();

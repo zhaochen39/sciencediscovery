@@ -15,6 +15,8 @@
 import { createTest } from "../../../test/support/tagged/compat.mjs";
 const { after, before, describe, test } = createTest(import.meta.url, { tags: ["category:ut", "os:linux", "arch:amd64", "arch:arm64"] });
 import assert from "node:assert/strict";
+import { once } from "node:events";
+import { createServer } from "node:http";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -148,4 +150,48 @@ describe("service supervision", () => {
     await supervisor.stop();
     await supervisor.stop();
   });
+});
+
+function inlineService(name: string, source: string): ServiceDefinition {
+  return { name, command: process.execPath, args: ["-e", source], cwd: process.cwd(), env: process.env };
+}
+
+test("stop joins concurrent callers and prevents any subsequent spawn", async () => {
+  const supervisor = new Supervisor({ log: () => {}, shutdownGraceMs: 150 });
+  const service = inlineService("existing", "setTimeout(() => {}, 10_000)");
+  try {
+    await supervisor.start([service]);
+    const first = supervisor.stop();
+    assert.equal(supervisor.stop(), first);
+    await assert.rejects(supervisor.start([inlineService("late", "process.exit(0)")]), /shutdown/);
+    await first;
+    assert.equal(supervisor.isRunning("existing"), false);
+    assert.equal(supervisor.isRunning("late"), false);
+  } finally { await supervisor.stop(); }
+});
+
+test("dependency exit aborts a downstream health probe and reports the first exit", async () => {
+  const probed = Promise.withResolvers<void>();
+  const server = createServer(async (request, response) => {
+    if (request.url === "/release") {
+      await probed.promise;
+      response.end();
+    } else probed.resolve(); // The downstream probe never returns a health verdict.
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const base = `http://127.0.0.1:${address.port}`;
+  const supervisor = new Supervisor({ log: () => {}, shutdownGraceMs: 150, healthAttempts: 1 });
+  try {
+    await supervisor.start([inlineService("dependency", `fetch(${JSON.stringify(`${base}/release`)}).then(() => process.exit(17))`)]);
+    const downstream = inlineService("downstream", "setTimeout(() => {}, 10_000)");
+    await assert.rejects(supervisor.start([{ ...downstream, healthUrl: `${base}/health` }]), /dependency exited during startup \(status 17\)/);
+    assert.deepEqual(await supervisor.waitForFirstExit(), { name: "dependency", code: 17, signal: null });
+  } finally {
+    probed.resolve();
+    server.closeAllConnections();
+    await Promise.all([supervisor.stop(), new Promise<void>(resolve => server.close(() => resolve()))]);
+  }
 });

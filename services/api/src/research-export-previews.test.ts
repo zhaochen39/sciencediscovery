@@ -478,3 +478,29 @@ test("default profiles remove pre-adoption aliases on the success and ready path
     assert.equal(calculations, afterDefaults + 2, "the ready-path sibling recalculated instead of aliasing r1");
   } finally { await previews.close(); }
 });
+
+for (const revisionFails of [false, true]) {
+  test(`deletion cancels a preview while reading its revision (read fails: ${revisionFails})`, async () => {
+    const reading = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    let calculations = 0;
+    const previews = new ResearchExportPreviews(async () => {
+      reading.resolve();
+      await release.promise;
+      if (revisionFails) throw Object.assign(new Error("missing revision"), { code: "ENOENT" });
+      return "r1";
+    }, async () => {
+      calculations++;
+      throw new Error("should not calculate after deletion");
+    });
+    const request = previews.get({ projectId: "p", sessionId: "s", level: "necessary", includeFullTrajectory: false });
+    const rejected = assert.rejects(request, statusError(404, "EXPORT_PREVIEW_RESOURCE_DELETED"));
+    await reading.promise;
+    previews.cancel("p", "s");
+    release.resolve();
+    try {
+      await rejected;
+      assert.equal(calculations, 0);
+    } finally { await previews.close(); }
+  });
+}

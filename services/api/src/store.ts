@@ -7952,18 +7952,41 @@ export class SessionStore {
       this.reviewerAuditTasksPath(task.sessionId),
       (tasks) => {
         this.assertSessionWritable(task.sessionId);
-        const existing = tasks.find((candidate) => candidate.id === task.id
-          || (!this.isResearchRestoring(task.sessionId) && candidate.inputFingerprint === task.inputFingerprint
-            && candidate.origin === task.origin
-            && candidate.status !== "cancelled"
-            && candidate.status !== "failed"
-            && candidate.status !== "superseded"
-            && candidate.status !== "skipped"));
-        if (existing) return structuredClone(existing);
-        tasks.push(structuredClone(task));
-        return structuredClone(task);
+        return this.insertReviewerAuditTask(tasks, task);
       },
     );
+  }
+
+  async upsertAutomaticReviewerAuditTask(
+    sessionId: string,
+    merge: (pending: ReviewerAuditTask | undefined, tasks: readonly ReviewerAuditTask[]) => ReviewerAuditTask,
+    batch: Pick<ReviewerAuditTask, "sourceRunId" | "reviewLevel">,
+  ): Promise<ReviewerAuditTask> {
+    this.assertSessionWritable(sessionId);
+    // Read, recheck batch eligibility, and write inside the same mutation as task claims.
+    return await this.mutateArray<ReviewerAuditTask, ReviewerAuditTask>(this.reviewerAuditTasksPath(sessionId), (tasks) => {
+      this.assertSessionWritable(sessionId);
+      const index = tasks.findIndex((task) => task.origin === "artifact_registered"
+        && task.status === "queued" && !task.checkpointPublishedAt
+        && task.sourceRunId === batch.sourceRunId && task.reviewLevel === batch.reviewLevel);
+      const task = merge(tasks[index], tasks);
+      if (index < 0) return this.insertReviewerAuditTask(tasks, task);
+      tasks[index] = structuredClone(task);
+      return structuredClone(task);
+    });
+  }
+
+  private insertReviewerAuditTask(tasks: ReviewerAuditTask[], task: ReviewerAuditTask): ReviewerAuditTask {
+    const existing = tasks.find((candidate) => candidate.id === task.id
+      || (!this.isResearchRestoring(task.sessionId) && candidate.inputFingerprint === task.inputFingerprint
+        && candidate.origin === task.origin
+        && candidate.status !== "cancelled"
+        && candidate.status !== "failed"
+        && candidate.status !== "superseded"
+        && candidate.status !== "skipped"));
+    if (existing) return structuredClone(existing);
+    tasks.push(structuredClone(task));
+    return structuredClone(task);
   }
 
   async updateReviewerAuditTask(

@@ -179,8 +179,13 @@ export class ResearchExportPreviews {
   async get(options: ExportPreviewOptions, deferWhileRunning = false, memo?: WarmMemo,
     scope?: Map<string, unknown>, request = new PreviewRevisionScope(this.revision)): Promise<ResearchExportPreview> {
     for (let attempt = 0; ; attempt++) {
-      try { return await this.getAttempt(options, deferWhileRunning, memo, scope, request); }
-      catch (error) {
+      if (this.closed) throw serviceClosed();
+      const controller = new AbortController();
+      this.controllers.set(controller, options);
+      try { return await this.getAttempt(options, deferWhileRunning, controller.signal, memo, scope, request); }
+      catch (failure) {
+        // Deletion can race the initial store read as well as the queued build.
+        const error: unknown = controller.signal.aborted ? controller.signal.reason : failure;
         // A run can begin after admission but before trajectory/CAS files are
         // published, so a read inside the preview can hit a file that is not on
         // disk yet. That is a retry, not a client error: an explicit preview used
@@ -197,23 +202,22 @@ export class ResearchExportPreviews {
         // The request's revision snapshot predates the deletion; retrying with it
         // would calculate the same obsolete evidence again.
         request.invalidate();
+      } finally {
+        this.controllers.delete(controller);
       }
     }
   }
 
-  private async getAttempt(options: ExportPreviewOptions, deferWhileRunning: boolean, memo?: WarmMemo,
+  private async getAttempt(options: ExportPreviewOptions, deferWhileRunning: boolean, signal: AbortSignal, memo?: WarmMemo,
     scope?: Map<string, unknown>, request = new PreviewRevisionScope(this.revision)): Promise<ResearchExportPreview> {
     const admitted = await this.assertCanCalculate(options, deferWhileRunning, memo, request);
-    if (this.closed) throw serviceClosed();
+    signal.throwIfAborted();
     const requestScope = scope ?? new Map<string, unknown>();
     const revision = admitted ?? await request.initial(options.projectId, options.sessionId);
-    if (this.closed) throw serviceClosed();
+    signal.throwIfAborted();
     const key = this.key(options, revision);
     const cached = this.entries.get(key);
     if (cached) return cached;
-    const controller = new AbortController();
-    this.controllers.set(controller, options);
-    const signal = controller.signal;
     const queueKey = `${options.projectId}:${options.sessionId ?? ""}`;
     const tail = this.queues.get(queueKey) ?? Promise.resolve();
     const work = tail.then(async () => {
@@ -231,6 +235,7 @@ export class ResearchExportPreviews {
         // A sibling profile may already have adopted a newer snapshot while this
         // one was queued; reuse it rather than calculating obsolete evidence.
         const current = await request.initial(options.projectId, options.sessionId);
+        signal.throwIfAborted();
         // An older queued request may already have calculated this revision.
         // Only consume completed work here: awaiting later queue entries deadlocks.
         const currentKey = this.key(options, current);
@@ -274,11 +279,6 @@ export class ResearchExportPreviews {
         return result;
       }
       throw new ApiStatusError(409, "Export preview is pending", "EXPORT_PREVIEW_PENDING");
-    }).catch((error: unknown) => {
-      // A concurrent deletion may make an awaited store read fail first.
-      // Preserve the intentional cancellation outcome rather than that race.
-      signal.throwIfAborted();
-      throw error;
     });
     const next = work.catch(() => undefined);
     this.queues.set(queueKey, next);
@@ -286,7 +286,7 @@ export class ResearchExportPreviews {
     // settled promise per session it has ever served.
     void next.then(() => { if (this.queues.get(queueKey) === next) this.queues.delete(queueKey); });
     this.remember(key, work);
-    void work.finally(() => this.controllers.delete(controller)).catch(() => {
+    void work.catch(() => {
       if (this.entries.get(key) === work) this.entries.delete(key);
     });
     return work;

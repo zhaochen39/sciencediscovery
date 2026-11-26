@@ -22,6 +22,7 @@
  * stack silently loses tool execution or agent turns.
  */
 import { spawn, type ChildProcess } from "node:child_process";
+import { setTimeout as delay } from "node:timers/promises";
 
 export interface ServiceDefinition {
   name: string;
@@ -46,12 +47,9 @@ const DEFAULT_HEALTH_ATTEMPTS = 300;
 const DEFAULT_HEALTH_INTERVAL_MS = 200;
 const DEFAULT_SHUTDOWN_GRACE_MS = 10_000;
 
-const sleep = (milliseconds: number): Promise<void> =>
-  new Promise((resolveSleep) => setTimeout(resolveSleep, milliseconds));
-
-async function probeHealth(url: string): Promise<boolean> {
+async function probeHealth(url: string, signal: AbortSignal): Promise<boolean> {
   try {
-    const response = await fetch(url, { signal: AbortSignal.timeout(2_000) });
+    const response = await fetch(url, { signal: AbortSignal.any([signal, AbortSignal.timeout(2_000)]) });
     return response.ok;
   } catch {
     return false;
@@ -64,12 +62,17 @@ interface RunningService {
   /** Resolves once the process is gone, with how it ended. */
   exited: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
   settled: boolean;
+  healthy: boolean;
 }
 
 export class Supervisor {
   private readonly running: RunningService[] = [];
   private readonly options: Required<Omit<SupervisorOptions, "log">> & { log: (message: string) => void };
-  private stopping = false;
+  private readonly startup = new AbortController();
+  private readonly firstExit = Promise.withResolvers<{ name: string; code: number | null; signal: NodeJS.Signals | null }>();
+  private stopWork?: Promise<void>;
+
+  get startupSignal(): AbortSignal { return this.startup.signal; }
 
   constructor(options: SupervisorOptions = {}) {
     this.options = {
@@ -81,46 +84,54 @@ export class Supervisor {
   }
 
   /** Spawn each service in order, gating on health before starting the next. */
-  async start(services: readonly ServiceDefinition[]): Promise<void> {
+  async start(services: readonly ServiceDefinition[], signal = this.startupSignal): Promise<void> {
+    const startupSignal = AbortSignal.any([this.startupSignal, signal]);
     for (const definition of services) {
+      startupSignal.throwIfAborted();
       this.options.log(`Starting ${definition.name}...`);
+      startupSignal.throwIfAborted();
       const child = spawn(definition.command, definition.args, {
         cwd: definition.cwd,
         env: definition.env,
         stdio: "inherit",
       });
-      const service: RunningService = {
-        child,
-        definition,
-        settled: false,
-        exited: new Promise((resolveExit) => {
-          child.on("exit", (code, signal) => {
-            service.settled = true;
-            resolveExit({ code, signal });
-          });
-          child.on("error", (error) => {
-            service.settled = true;
-            this.options.log(`${definition.name} could not be started: ${error.message}`);
-            resolveExit({ code: 127, signal: null });
-          });
-        }),
+      const exit = Promise.withResolvers<Awaited<RunningService["exited"]>>();
+      const service: RunningService = { child, definition, settled: false, healthy: !definition.healthUrl, exited: exit.promise };
+      const onExit = (code: number | null, exitSignal: NodeJS.Signals | null): void => {
+        if (service.settled) return;
+        service.settled = true;
+        exit.resolve({ code, signal: exitSignal });
+        this.firstExit.resolve({ name: definition.name, code, signal: exitSignal });
+        const outcome = exitSignal ? `signal ${exitSignal}` : `status ${String(code)}`;
+        const phase = service.healthy ? "during startup" : "before becoming healthy";
+        this.startup.abort(new Error(`${definition.name} exited ${phase} (${outcome}). See the output above.`));
       };
+      child.once("exit", onExit);
+      child.on("error", (error) => {
+        this.options.log(`${definition.name} could not be started: ${error.message}`);
+        if (child.pid === undefined) onExit(127, null);
+      });
       this.running.push(service);
-      if (definition.healthUrl) await this.waitHealthy(service, definition.healthUrl);
+      if (definition.healthUrl) {
+        await this.waitHealthy(service, definition.healthUrl, startupSignal);
+        service.healthy = true;
+      }
+      startupSignal.throwIfAborted();
     }
   }
 
-  private async waitHealthy(service: RunningService, url: string): Promise<void> {
-    for (let attempt = 0; attempt < this.options.healthAttempts; attempt += 1) {
-      if (service.settled) {
-        const { code, signal } = await service.exited;
-        throw new Error(
-          `${service.definition.name} exited before becoming healthy `
-          + `(${signal ? `signal ${signal}` : `status ${String(code)}`}). See the output above.`,
-        );
+  private async waitHealthy(service: RunningService, url: string, signal: AbortSignal): Promise<void> {
+    try {
+      for (let attempt = 0; attempt < this.options.healthAttempts; attempt += 1) {
+        signal.throwIfAborted();
+        const healthy = await probeHealth(url, signal);
+        signal.throwIfAborted();
+        if (healthy) return;
+        await delay(this.options.healthIntervalMs, undefined, { signal });
       }
-      if (await probeHealth(url)) return;
-      await sleep(this.options.healthIntervalMs);
+    } catch (error) {
+      signal.throwIfAborted();
+      throw error;
     }
     throw new Error(`${service.definition.name} did not become healthy at ${url}.`);
   }
@@ -134,27 +145,29 @@ export class Supervisor {
    * Resolve when the first service exits. `serve` awaits this so that a dead
    * gateway or runner brings the stack down instead of leaving a broken UI up.
    */
-  async waitForFirstExit(): Promise<{ name: string; code: number | null; signal: NodeJS.Signals | null }> {
-    return await Promise.race(
-      this.running.map(async (service) => {
-        const outcome = await service.exited;
-        return { name: service.definition.name, ...outcome };
-      }),
-    );
+  waitForFirstExit(): Promise<{ name: string; code: number | null; signal: NodeJS.Signals | null }> {
+    return this.firstExit.promise;
   }
 
   /** SIGTERM every service in reverse start order, escalating to SIGKILL. */
-  async stop(): Promise<void> {
-    if (this.stopping) return;
-    this.stopping = true;
+  stop(): Promise<void> {
+    this.stopWork ??= Promise.resolve().then(() => this.stopChildren());
+    this.startup.abort(new Error("Service startup cancelled by shutdown"));
+    return this.stopWork;
+  }
+
+  private async stopChildren(): Promise<void> {
     for (const service of [...this.running].reverse()) {
       if (!service.settled) service.child.kill("SIGTERM");
     }
     const pending = this.running.filter((service) => !service.settled);
-    await Promise.race([
-      Promise.all(pending.map((service) => service.exited)),
-      sleep(this.options.shutdownGraceMs),
-    ]);
+    const grace = new AbortController();
+    try {
+      await Promise.race([
+        Promise.all(pending.map((service) => service.exited)),
+        delay(this.options.shutdownGraceMs, undefined, { signal: grace.signal }),
+      ]);
+    } finally { grace.abort(); }
     for (const service of this.running) {
       if (!service.settled) {
         this.options.log(`${service.definition.name} ignored SIGTERM; sending SIGKILL.`);
