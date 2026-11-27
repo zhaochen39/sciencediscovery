@@ -433,6 +433,8 @@ export type SessionRunStatus =
   | "interrupted";
 
 export interface SessionRun {
+  /** Server-created provenance for a JiuwenSwarm candidate preparation. */
+  candidatePreparation?: import("./idea-tree.js").CandidatePreparation;
   /** Trusted notification context, never accepted from SendMessageRequest. */
   notificationDelivery?: {
     sessionId: string; agentId: string; epoch: number; agentEpoch: number;

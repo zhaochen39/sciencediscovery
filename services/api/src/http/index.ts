@@ -271,6 +271,9 @@ import {
   stageGeneratedKey,
 } from "../store/ssh-config.js";
 import { ideaTreeSkillDeletionReferences } from "../idea-tree/deletion-impact.js";
+import { createExperimentValidation } from "../idea-tree/experiment.js";
+import { buildCandidatePreparation, candidatePreparationOutput } from "../idea-tree/preparation.js";
+import type { CandidateExperimentRequest } from "@sciencediscovery/schema";
 import { resolveExecutorCapability } from "../idea-tree/executor-capability.js";
 import { resolveEnvironmentInstallRequest } from "../environment-sources.js";
 import {
@@ -1158,6 +1161,16 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
   const jiuwenSwarm = jiuwenSwarmConfigFromEnv();
   store.setSkillSelectionAvailable(!jiuwenSwarm || jiuwenSwarm.skillSelection === "desktop");
   const webBackend = jiuwenSwarm ? "jiuwenswarm" as const : "native" as const;
+  const experimentValidation = createExperimentValidation({ store, runner: runnerClient, recorder: provenanceRecorder,
+    readResearch: (sessionId, researchId) => ideaResearch.command(sessionId, "get", { researchId }),
+    score: (sessionId, input, job) => ideaResearch.validateCandidate(sessionId, provenanceRecorder.cas, input, job.plan),
+    attachFailure: (sessionId, job, validation) => ideaResearch.command(sessionId, "attach_validation_failure", {
+      researchId: job.researchId, candidateId: job.candidateId, validation,
+    }),
+  });
+  if (jiuwenSwarm) void ready.then(() => experimentValidation.resume()).catch((error) => {
+    apiLog.warn("candidate_experiment_recovery_failed", { errorMessage: shortErrorMessage(error) });
+  });
   // The UI's language as JiuwenSwarm's; remembered so that each page load does not rewrite JiuwenSwarm's config.
   let jiuwenSwarmLanguage: "en" | "zh" | undefined;
   const syncJiuwenSwarmWeb = async () => jiuwenSwarm
@@ -1319,6 +1332,41 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
   // reports degraded instead of parking the response.
   const settleWithin = <T>(promise: Promise<T>, ms: number, fallback: T): Promise<T> =>
     Promise.race([promise, new Promise<T>(resolve => setTimeout(() => resolve(fallback), ms))]);
+
+  async function queueSessionMessage(sessionId: string, body: SendMessageRequest, preparation?: SessionRun["candidatePreparation"]) {
+    const run = await createQueuedRun(
+      store,
+      skillCatalog,
+      skillLibraryCatalog,
+      ideaTreeAuthorities,
+      sessionId,
+      body,
+      ideaTreeRepository(sessionId),
+      preparation,
+    );
+    scheduleSessionRuns(
+      store,
+      runnerClient,
+      provenanceRecorder,
+      mcpBroker,
+      webBroker,
+      mcpRegistry,
+      mcpCatalog,
+      artifactManager,
+      paperService,
+      remoteCompute,
+      skillCatalog,
+      skillLibraryCatalog,
+      ideaTreeAuthorities,
+      ideaTreeRepository(sessionId),
+      memoryGraphSink,
+      sessionId,
+      config,
+      memoryGraphClient,
+      evolveRuntimeFactory,
+    );
+    return run;
+  }
 
   const server = createServer(async (request, response) => {
     const requestId = randomUUID();
@@ -4224,36 +4272,7 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
       if (sessionRunsMatch && request.method === "POST") {
         const sessionId = sessionRunsMatch[1]!;
         if (!store.getSession(sessionId)) return sendError(response, 404, "Session not found");
-        const run = await createQueuedRun(
-          store,
-          skillCatalog,
-          skillLibraryCatalog,
-          ideaTreeAuthorities,
-          sessionId,
-          await readJson<SendMessageRequest>(request),
-          ideaTreeRepository(sessionId),
-        );
-        scheduleSessionRuns(
-          store,
-          runnerClient,
-          provenanceRecorder,
-          mcpBroker,
-          webBroker,
-          mcpRegistry,
-          mcpCatalog,
-          artifactManager,
-          paperService,
-          remoteCompute,
-          skillCatalog,
-          skillLibraryCatalog,
-          ideaTreeAuthorities,
-          ideaTreeRepository(sessionId),
-          memoryGraphSink,
-          sessionId,
-          config,
-          memoryGraphClient,
-          evolveRuntimeFactory,
-        );
+        const run = await queueSessionMessage(sessionId, await readJson<SendMessageRequest>(request));
         sendJson(response, 201, run);
         return;
       }
@@ -4600,15 +4619,62 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
         }
         return;
       }
+      const experimentMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/idea-tree\/experiments$/);
+      if (experimentMatch && request.method === "POST") {
+        const sid = experimentMatch[1]!;
+        if (!store.getSession(sid)) return sendError(response, 404, "Session not found");
+        if (!jiuwenSwarm) return sendError(response, 409, "Candidate experiments require the JiuwenSwarm backend");
+        const input = await readJson<Record<string, unknown>>(request);
+        try {
+          if (input.operation === "prepare" && typeof input.researchId === "string") {
+            const researchId = input.researchId;
+            const run = await experimentValidation.control(sid, researchId, async () => {
+              if (await sessionHasActiveRun(store, sid)) throw new Error("An Agent run is already active in this session");
+              const view = await ideaResearch.command(sid, "get", { researchId });
+              const { preparation, prompt } = await buildCandidatePreparation(store, sid, view, input);
+              return queueSessionMessage(sid, { content: prompt }, preparation);
+            });
+            return sendJson(response, 202, candidatePreparationOutput(store, sid, run));
+          }
+          if (input.operation === "preparations" && typeof input.researchId === "string") {
+            const histories = (await store.listSessionRuns(sid)).filter(run => run.candidatePreparation?.researchId === input.researchId
+              && run.candidatePreparation?.candidateId === input.candidateId);
+            const latest = histories.at(-1);
+            return sendJson(response, 200, latest ? candidatePreparationOutput(store, sid, latest) : null);
+          }
+          if (input.operation === "prepared" && typeof input.runId === "string") {
+            const run = await store.getSessionRun(sid, input.runId);
+            if (!run?.candidatePreparation) return sendError(response, 404, "Candidate preparation not found");
+            return sendJson(response, 200, candidatePreparationOutput(store, sid, run));
+          }
+          if (input.operation === "list" && typeof input.researchId === "string") return sendJson(response, 200, await experimentValidation.list(sid, input.researchId));
+          if (input.operation === "start") return sendJson(response, 200, await experimentValidation.start(sid, input as unknown as CandidateExperimentRequest));
+          if (typeof input.id === "string" && input.operation === "retry") return sendJson(response, 200, await experimentValidation.retry(sid, input.id));
+          if (typeof input.id === "string" && input.operation === "cancel") return sendJson(response, 200, await experimentValidation.cancel(sid, input.id));
+          if (typeof input.id === "string" && input.operation === "poll") return sendJson(response, 200, await experimentValidation.poll(sid, input.id));
+          return sendError(response, 400, "Unknown candidate experiment operation");
+        } catch (error) { return sendError(response, 400, error instanceof Error ? error.message : String(error)); }
+      }
       const researchMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/idea-tree\/research$/);
       if (researchMatch && (request.method === "GET" || request.method === "POST")) {
         const sid = researchMatch[1]!;
         if (!store.getSession(sid)) return sendError(response, 404, "Session not found");
         const input = request.method === "POST" ? await readJson<Record<string, unknown>>(request) : {};
         const operation = request.method === "GET" ? "list" : String(input.operation ?? "create");
-        if (!["list", "get", "create", "pause", "continue", "end", "defaults"].includes(operation)) return sendError(response, 400, "Unknown research operation");
+        if (!["list", "get", "create", "pause", "pause_for_validation", "continue", "end", "defaults", "validation_inputs"].includes(operation)) return sendError(response, 400, "Unknown research operation");
+        if (!jiuwenSwarm && ["validation_inputs", "pause_for_validation"].includes(operation)) return sendError(response, 409, "Candidate experiments require the JiuwenSwarm backend");
         try {
-          const result = await ideaResearch.command(sid, operation, input);
+          if (operation === "validation_inputs") {
+            if (typeof input.researchId !== "string") return sendError(response, 400, "Choose a research");
+            return sendJson(response, 200, await ideaResearch.validationInputs(sid, input.researchId));
+          }
+          const applyResearchCommand = () => ideaResearch.command(sid, operation, input);
+          const result = jiuwenSwarm && (operation === "continue" || operation === "end")
+            ? await experimentValidation.control(sid, input.researchId, async () => {
+              await experimentValidation.assertNoPreparation(sid, input.researchId);
+              return applyResearchCommand();
+            })
+            : await applyResearchCommand();
           if (operation === "create" && typeof input.content === "string") {
             await store.appendMessage(sid, "user", input.content);
             await store.appendMessage(sid, "assistant", `已启动 Idea Tree 研究（${result.research.id}）。Python 引擎正在后台执行构思、设计、独立评估和迭代。请在 Idea Tree 卡片查看实时进度，也可以稍后询问研究结果。`);
@@ -5327,6 +5393,7 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
   }).catch(() => undefined);
   server.once("close", () => { configurationClosed = true; clearInterval(configurationTimer); });
   server.on("close", () => {
+    experimentValidation.close();
     store.close();
   });
   patchEphemeralCallback(server);

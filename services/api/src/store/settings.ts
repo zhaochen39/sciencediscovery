@@ -648,6 +648,7 @@ export function normalizeIdeaTreeSettings(
     maxDepth,
     maxNodes,
     scoreDirection,
+    ...((input.candidateValidationEnabled ?? current.candidateValidationEnabled) === true ? { candidateValidationEnabled: true } : {}),
     ...(designSystemPrompt ? { designSystemPrompt } : {}),
     ...(aggregatorSystemPrompt ? { aggregatorSystemPrompt } : {}),
     ...(propagateInsightSystemPrompt ? { propagateInsightSystemPrompt } : {}),
@@ -675,6 +676,7 @@ export function resolveIdeaTreeSettings(value: unknown): IdeaTreeSettings {
     scoreDirection: value.scoreDirection === "maximize" || value.scoreDirection === "minimize"
       ? value.scoreDirection
       : DEFAULT_IDEA_TREE_SETTINGS.scoreDirection,
+    ...(value.candidateValidationEnabled === true ? { candidateValidationEnabled: true } : {}),
     ...(typeof value.designSystemPrompt === "string" && value.designSystemPrompt.trim()
       ? { designSystemPrompt: value.designSystemPrompt.trim() }
       : {}),

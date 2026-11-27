@@ -96,6 +96,7 @@ export function IdeaTreeSettings({ client }: { client: ApiClient }) {
       maxNodes: draft.maxNodes,
       // `null` is the API's "no per-research cap"; an empty box means exactly that.
       maxTokens: draft.maxTokens ?? null,
+      ...(draft.candidateValidationEnabled === undefined ? {} : { candidateValidationEnabled: draft.candidateValidationEnabled }),
       ...(draft.designSystemPrompt === undefined ? {} : { designSystemPrompt: draft.designSystemPrompt }),
       ...(draft.aggregatorSystemPrompt === undefined ? {} : { aggregatorSystemPrompt: draft.aggregatorSystemPrompt }),
       ...(draft.propagateInsightSystemPrompt === undefined ? {} : { propagateInsightSystemPrompt: draft.propagateInsightSystemPrompt }),
@@ -133,6 +134,11 @@ export function IdeaTreeSettings({ client }: { client: ApiClient }) {
                 options={INTENSITIES}
                 value={draft.explorationIntensity}
               />
+            </Row>
+            <Row title="候选实验验证" hint="仅对新建研究生效。">
+              <input aria-label="为新建研究启用候选实验验证" type="checkbox"
+                checked={draft.candidateValidationEnabled === true}
+                onChange={(event) => patch({ candidateValidationEnabled: event.target.checked })} />
             </Row>
             <Row hint={t.directionHint} title={t.direction}>
               <Select

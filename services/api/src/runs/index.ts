@@ -3456,6 +3456,7 @@ export async function createQueuedRun(
   sessionId: string,
   body: SendMessageRequest,
   ideaTreeRepository: IdeaTreePersistence,
+  candidatePreparation?: SessionRun["candidatePreparation"],
 ): Promise<SessionRun> {
   const session = store.assertSessionWritable(sessionId);
   const wakeGeneration = store.notifications.generation(sessionId);
@@ -3506,6 +3507,7 @@ export async function createQueuedRun(
   }
   let run = await store.createSessionRun({
     annotationIds: body.annotationIds,
+    candidatePreparation,
     prompt,
     references,
     sessionId,

@@ -1,7 +1,9 @@
 import { createServer } from "node:http";
 
 /** Only the provider is simulated. The API, Python engine and persistence are real. */
-export async function ideaResearchModel() {
+export async function ideaResearchModel(options?: {
+  nextHypothesis?: (payload: Record<string, unknown>) => Promise<string>;
+}) {
   const requests: Array<{ system: string; payload: any }> = [];
   let hold = true;
   let holdAssessments = false;
@@ -61,7 +63,14 @@ export async function ideaResearchModel() {
       // required for a ROOT proposal). Size the refinements from the parent's
       // depth so the candidate leaf always lands exactly on maxDepth.
       const refinements = Math.max(0, payload.maxDepth - parentDepth - 1);
-      answer = { candidates: [{ parentId, direction: `Direction ${payload.round % 2}`, refinements: Array.from({length: refinements}, (_, i) => `Refinement ${i + 1}`), hypothesis: `Candidate ${payload.round}: reduce metal leaching` }], reason: "Compare alternatives and improve prior weaknesses" };
+      let hypothesis = `Candidate ${payload.round}: reduce metal leaching`;
+      if (options?.nextHypothesis && payload.round === 2) {
+        try { hypothesis = await options.nextHypothesis(payload); }
+        catch { res.writeHead(502).end(); return; }
+      }
+      const evidence = payload.candidateValidation?.find((item: any) => item.metric);
+      const citations = evidence ? { basedOnCandidateIds: [evidence.candidateId], basedOnValidationIds: [evidence.id] } : {};
+      answer = { candidates: [{ ...citations, parentId, direction: `Direction ${payload.round % 2}`, refinements: Array.from({length: refinements}, (_, i) => `Refinement ${i + 1}`), hypothesis }], reason: "Compare alternatives and improve prior weaknesses" };
     } else if (payload.perspective) {
       answer = { text: `${payload.perspective}: assess uncertainty`, score: 7 };
     } else if (payload.children) {

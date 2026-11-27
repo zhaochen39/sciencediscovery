@@ -104,7 +104,7 @@ def validate_result(role: str, value: Any, assessor_roles: set[str]) -> dict:
                 raise ValueError('refinements must be an array')
             for refinement in item.get('refinements', []):
                 text(refinement, 'refinement', 1000)
-            for key in ('basedOnCandidateIds', 'addressesInsightIds'):
+            for key in ('basedOnCandidateIds', 'addressesInsightIds', 'basedOnValidationIds'):
                 if key in item and (not isinstance(item[key], list) or not all(isinstance(identifier, str) for identifier in item[key])):
                     raise ValueError(f'{key} must be an array of ids')
             if item.get('targetedWeakness') is not None:
@@ -202,6 +202,10 @@ def graph_node(n: dict, heavy: bool = True) -> dict:
     view = {**n, 'searchStatus': n.get('searchStatus', 'active'), 'priority': n.get('priority', 0),
             'attemptCount': n.get('attemptCount', 0), 'artifactRefs': [], 'activeExecutionId': None,
             'lastExecutionId': None, 'completedResultHandle': None, 'pruneReason': n.get('pruneReason')}
+    if n.get('validations'):
+        last = n['validations'][-1]
+        view['artifactRefs'] = list(dict.fromkeys([last['baselineArtifactId'], last['candidateArtifactId']]))
+        view['lastExecutionId'] = last['candidateExecutionId']
     if heavy:
         # Serialised only for an explicit `get`: a frame never builds the string it
         # would drop, which is the whole point of the lean shape.
@@ -227,7 +231,10 @@ def node_signature(n: dict) -> tuple:
             n.get('createdAt'), n.get('updatedAt'),
             n.get('cycleComplete'), tuple(n.get('propagatedTo', ())), n.get('trimmedDirection'),
             tuple(n.get('derivedFromCandidateIds', ())), tuple(n.get('addressesInsightIds', ())),
-            n.get('targetedWeakness'), n.get('explorationType'))
+            n.get('targetedWeakness'), n.get('explorationType'),
+            tuple(item['id'] for item in n.get('validations', ())),
+            tuple(item['id'] for item in n.get('validationFailures', ())),
+            tuple(n.get('basedOnValidationIds', ())))
 
 
 def graph_edges(nodes: list[dict], only: set[str] | None = None) -> list[dict]:
@@ -370,6 +377,8 @@ class IdeaTreeEngine:
         """The model's validated result. `check` adds rules that need the tree; breaking one gets the same one correction."""
         self.check_stop()
         shape = '{"candidates":[{"parentId":"selected id", "direction":"new direction when needed", "refinements":[], "hypothesis":"...", "basedOnCandidateIds":[], "addressesInsightIds":[], "targetedWeakness":"...", "expectedImprovement":"...", "newRisk":"...", "rationale":"...", "explorationType":"exploit or explore"}],"reason":"..."}' if role == 'ideate' else ('{"text":"...","score":1.0}' if role in {item['id'] for item in self.assessors()} else ('{"text":"...","strengths":[],"failureModes":[],"uncertainties":[],"evidenceGaps":[],"recommendedNextMoves":[],"constraintFlags":[],"confidence":0.0}' if role == 'aggregate' else '{"text":"..."}'))
+        if role == 'ideate' and payload.get('candidateValidation'):
+            shape = shape.replace('"basedOnCandidateIds":[]', '"basedOnCandidateIds":[], "basedOnValidationIds":[]')
         system = self.role_prompt(role) + '\nReturn JSON only, matching: ' + shape
         for attempt in range(2):
             self.check_stop()
@@ -423,6 +432,37 @@ class IdeaTreeEngine:
                               if isinstance(error, EmptyAnswer) else str(error))
                 payload = {**payload, 'correction': correction, 'previousResponse': str(raw)[:4000] if raw is not None else ''}
         raise AssertionError('unreachable')
+
+    def experiment_feedback(self, selected=()):
+        settings = self.state['settings']
+        if not settings.get('candidateValidationEnabled') or not settings.get('candidateValidationFeedbackEnabled', True):
+            return {}
+        fields = ('id', 'metric', 'baseline', 'candidate', 'improvement', 'sampleCount', 'referenceVersionId', 'seed', 'environmentRevisionId')
+        selected_ids = {n['id'] for n in selected}
+        nodes = reversed(self.state['nodes'])
+
+        def relevant(node):
+            if node['id'] in selected_ids:
+                return True
+            return any(self.is_descendant_of(node['id'], parent) or self.is_descendant_of(parent, node['id'])
+                       for parent in selected_ids)
+
+        evidence = []
+        for node in sorted(nodes, key=lambda node: not relevant(node)):
+            evidence.extend(dict(candidateId=node['id'], **{key: result[key] for key in fields if key in result})
+                            for result in reversed(node.get('validations', ())))
+            for failure in reversed(node.get('validationFailures', ())):
+                if sum('failureCode' in record for record in evidence) >= 2:
+                    break
+                evidence.append(dict(candidateId=node['id'], id=failure['id'], stage=failure['stage'], failureCode=failure['code']))
+            if len(evidence) >= 8:
+                break
+        if not evidence:
+            return {}
+        return {'candidateValidation': evidence[:8],
+                'candidateValidationGuidance': 'These are development observations. Positive improvement favors the candidate. '
+                'Compare only results measured under the same reference, metric, seed and environment. '
+                'A failure has no score. Cite any observations you use in basedOnValidationIds and their candidates in basedOnCandidateIds.'}
 
     def context(self):
         return dict(objective=self.state['objective'], materials=self.state['materials'])
@@ -692,6 +732,9 @@ class IdeaTreeEngine:
                     self.save()
                     count = min(s['settings']['candidatesPerRound'], remaining)
                     s['phase'] = 'ideate'
+                    feedback = self.experiment_feedback(selected)
+                    observations = {item['id']: item['candidateId'] for item in feedback.get('candidateValidation', ())}
+
                     def check_proposals(ideas, count=count):
                         # Reject the whole proposal before changing the tree.
                         known_ids = {n['id'] for n in s['nodes']}
@@ -699,6 +742,9 @@ class IdeaTreeEngine:
                             raise ValueError('Proposed parent does not exist')
                         for proposal in ideas['candidates'][:count]:
                             self.validate_proposal(proposal, s['selectedDirectionIds'])
+                            sources = set(proposal.get('basedOnCandidateIds', ()))
+                            if any(observations.get(reference) not in sources for reference in proposal.get('basedOnValidationIds', ())):
+                                raise ValueError('Validation citations must name provided observations and their source candidates')
                     # One unusable proposal must not end the research. The stage gets
                     # its single correction inside `ask`; if the answer is still
                     # invalid the round is skipped and the next ideation tries again,
@@ -707,7 +753,7 @@ class IdeaTreeEngine:
                     # otherwise healthy run. `round` still advances, so skipping cannot
                     # loop forever, and the activity record keeps the failure visible.
                     try:
-                        ideas = await self.ask('ideate', {**self.context(), 'template': dict(id=s['template']['id'], label=s['template']['label'], assessors=[item['label'] for item in s['template']['assessors']]), 'nodes': self.overview(selected), 'selectedParentIds': s['selectedDirectionIds'], 'selectedParentConstraints': [self.expansion_constraints(parent) for parent in selected], 'round': s['round'] + 1, 'maximumCandidates': count, 'maxDepth': s['settings']['maxDepth'], 'scoreDirection': s['settings']['scoreDirection']}, check_proposals)
+                        ideas = await self.ask('ideate', {**self.context(), **feedback, 'template': dict(id=s['template']['id'], label=s['template']['label'], assessors=[item['label'] for item in s['template']['assessors']]), 'nodes': self.overview(selected), 'selectedParentIds': s['selectedDirectionIds'], 'selectedParentConstraints': [self.expansion_constraints(parent) for parent in selected], 'round': s['round'] + 1, 'maximumCandidates': count, 'maxDepth': s['settings']['maxDepth'], 'scoreDirection': s['settings']['scoreDirection']}, check_proposals)
                     except ValueError as error:
                         s['round'] += 1
                         s['batch'] = []
@@ -745,6 +791,8 @@ class IdeaTreeEngine:
                         candidate = self.add(parent, proposal['hypothesis'], 'candidate')
                         if candidate:
                             candidate.update(derivedFromCandidateIds=proposal.get('basedOnCandidateIds', []), addressesInsightIds=proposal.get('addressesInsightIds', []), targetedWeakness=proposal.get('targetedWeakness'), explorationType=proposal.get('explorationType', 'explore'))
+                            if proposal.get('basedOnValidationIds'):
+                                candidate['basedOnValidationIds'] = list(dict.fromkeys(proposal['basedOnValidationIds']))
                             # A parent at the last expandable depth leaves no room for a
                             # direction node, so the candidate attaches directly under it.
                             # Keep the direction the model named rather than discarding it.
@@ -791,6 +839,9 @@ class IdeaTreeEngine:
                     self.save()
                 s['batch'] = []
                 self.save()
+                if s.pop('pauseForValidation', False) and s['round'] < s['settings']['maxRounds']:
+                    s.update(status='paused', reason='Paused at a round checkpoint for candidate validation')
+                    return
             s.update(status='completed', phase='complete', reason=s['reason'] or 'Exploration round limit reached')
         except Interrupted:
             s.update(status='ended' if self.stop_action == 'end' else 'paused', reason='Ended by user' if self.stop_action == 'end' else 'Paused by user')

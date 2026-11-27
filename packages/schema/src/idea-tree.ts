@@ -118,6 +118,9 @@ export interface IdeaTreeNode {
   id: string;
   insight: string | null;
   lastExecutionId: string | null;
+  validations?: CandidateValidation[];
+  validationFailures?: CandidateValidationFailure[];
+  basedOnValidationIds?: string[];
   parentId: string | null;
   priority: number;
   pruneReason: string | null;
@@ -279,7 +282,104 @@ export interface IdeaTreeRunSettingsSnapshot {
 }
 
 /** Autonomous Python research. These statuses are independent of chat runs. */
+export type CandidateValidationMetric = "nrmse" | "mae" | "accuracy";
+
+export interface CandidateValidationRequest {
+  metric: CandidateValidationMetric;
+  referenceVersionId: string;
+  baselineVersionId: string;
+  candidateVersionId: string;
+}
+
+export interface CandidateValidation extends CandidateValidationRequest {
+  id: string;
+  scorerVersion: "matched-json-samples/v1";
+  baselineArtifactId: string;
+  candidateArtifactId: string;
+  baselineExecutionId: string;
+  candidateExecutionId: string;
+  baseline: number;
+  candidate: number;
+  improvement: number;
+  sampleCount: number;
+  planDigest?: string;
+  seed?: number;
+  environmentRevisionId?: string;
+}
+
+export type CandidateExperimentStage = "baseline_execution" | "candidate_execution" | "scoring" | "attachment";
+export interface CandidateValidationFailure {
+  id: string;
+  stage: CandidateExperimentStage;
+  code: "execution_failed" | "timeout" | "invalid_predictions";
+  executionId?: string;
+}
+
+export interface CandidateExperimentPlan {
+  schemaVersion: 1;
+  digest: string;
+  seed: number;
+  scorerVersion: "matched-json-samples/v1";
+  inputHash: string;
+  referenceHash: string;
+  baselineScriptHash: string;
+  candidateScriptHash: string;
+  timeoutMs: number;
+  maxOutputBytes: number;
+  maxWorkspaceBytes: number;
+}
+
+export interface CandidatePreparation {
+  researchId: string;
+  candidateId: string;
+  sourceVersionId: string;
+  inputVersionId: string;
+  outputPath: string;
+  evidenceIds: string[];
+}
+
+export interface CandidatePreparationResult {
+  runId: string;
+  inputVersionId: string;
+  sourceVersionId: string;
+  status: "running" | "ready" | "failed";
+  versionId?: string;
+}
+
+export interface CandidateExperimentRequest {
+  researchId: string;
+  candidateId: string;
+  metric: CandidateValidationMetric;
+  inputVersionId: string;
+  referenceVersionId: string;
+  baselineScriptVersionId: string;
+  candidateScriptVersionId: string;
+  preparationRunId?: string;
+  seed?: number;
+}
+
+export interface CandidateExperiment extends CandidateExperimentRequest {
+  id: string;
+  createdAt: string;
+  timeoutMs: number;
+  plan?: CandidateExperimentPlan;
+  attempt?: number;
+  retryOf?: string;
+  stage?: CandidateExperimentStage;
+  failure?: CandidateValidationFailure;
+  status: "running" | "unconfirmed" | "failed" | "cancelled" | "ready";
+  executionIds: Partial<Record<"baseline" | "candidate", string>>;
+  predictionVersionIds: Partial<Record<"baseline" | "candidate", string>>;
+  validationId?: string;
+  /** Snapshot of the exact comparison committed to this candidate. */
+  result?: CandidateValidation;
+  error?: string;
+  stopRequested?: boolean;
+}
+
 export interface IdeaResearchSettings {
+  candidateValidationEnabled?: boolean;
+  candidateValidationFeedbackEnabled?: boolean;
   maxRounds: number;
   candidatesPerRound: number;
   maxSearchRounds: number;
@@ -305,6 +405,7 @@ export interface IdeaResearchTemplate {
   assessors: Array<{ id: string; label: string }>;
 }
 export interface IdeaResearchState {
+  pauseForValidation?: boolean;
   activities?: IdeaResearchActivity[];
   id: string;
   status: "running" | "pausing" | "paused" | "interrupted" | "completed" | "ended" | "budget_exhausted";

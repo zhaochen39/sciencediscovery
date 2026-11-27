@@ -92,6 +92,7 @@ export function IdeaTreeExplorer({
   graph,
   autonomous = false,
   controls,
+  renderCandidateValidation,
   onOpenArtifact,
   onOpenSubagent,
   loading,
@@ -102,6 +103,7 @@ export function IdeaTreeExplorer({
   graph: IdeaTreeGraph;
   autonomous?: boolean;
   controls?: ReactNode;
+  renderCandidateValidation?: (node: IdeaTreeNode, selectNode: (id: string) => void) => ReactNode;
   onOpenArtifact?: (id: string) => void;
   onOpenSubagent?: (id: string) => void;
   loading?: boolean;
@@ -165,7 +167,7 @@ export function IdeaTreeExplorer({
       </header>
       {controls}
       <div className="idea-tree-explorer-body">
-        <aside className="idea-tree-explorer-detail"><IdeaTreeNodeDetail autonomous={autonomous} node={selected} onOpenArtifact={onOpenArtifact} onOpenSubagent={onOpenSubagent} /></aside>
+        <aside className="idea-tree-explorer-detail"><IdeaTreeNodeDetail autonomous={autonomous} node={selected} onOpenArtifact={onOpenArtifact} onOpenSubagent={onOpenSubagent} />{selected?.kind === "candidate" && renderCandidateValidation?.(selected, setSelectedId)}</aside>
         <main className="idea-tree-explorer-graph">
           <div className="idea-tree-toolbar">
             <label className="idea-tree-search">

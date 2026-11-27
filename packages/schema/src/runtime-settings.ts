@@ -303,6 +303,7 @@ export interface UpdateMemoryGraphSettingsRequest {
  * 生效时机：保存后对后续 Run 立即生效，进行中的 Run 不受影响。
  */
 export interface IdeaTreeSettings {
+  candidateValidationEnabled?: boolean;
   templateId: "scientific-hypothesis-general/v1" | "water-treatment-materials/v1";
   explorationIntensity: "quick" | "standard" | "deep";
   maxTokens?: number | null;
@@ -346,6 +347,7 @@ export const DEFAULT_IDEA_TREE_SETTINGS: IdeaTreeSettings = {
 
 /** Idea Tree 设置返回给前端的视图 */
 export interface IdeaTreeSettingsDetails {
+  candidateValidationEnabled?: boolean;
   templateId: "scientific-hypothesis-general/v1" | "water-treatment-materials/v1";
   explorationIntensity: "quick" | "standard" | "deep";
   maxTokens?: number | null;
@@ -359,6 +361,7 @@ export interface IdeaTreeSettingsDetails {
 
 /** Idea Tree 设置写入 payload。每个字段可选，独立更新。空值（空字符串/undefined）即使用默认。 */
 export interface UpdateIdeaTreeSettingsRequest {
+  candidateValidationEnabled?: boolean;
   templateId?: "scientific-hypothesis-general/v1" | "water-treatment-materials/v1";
   explorationIntensity?: "quick" | "standard" | "deep";
   maxTokens?: number | null;

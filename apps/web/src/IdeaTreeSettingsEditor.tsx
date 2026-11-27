@@ -7,12 +7,14 @@ import { useLocale, type MessageKey } from "./i18n/index.js";
 import type { IdeaTreeSettingsDetails, UpdateIdeaTreeSettingsRequest } from "@sciencediscovery/schema";
 
 export interface IdeaTreeSettingsDraft {
+  candidateValidationEnabled?: boolean;
   templateId: "scientific-hypothesis-general/v1" | "water-treatment-materials/v1";
   explorationIntensity: "quick" | "standard" | "deep";
 }
 
 export function createIdeaTreeSettingsDraft(settings: IdeaTreeSettingsDetails): IdeaTreeSettingsDraft {
   return {
+    ...(settings.candidateValidationEnabled ? { candidateValidationEnabled: true } : {}),
     templateId: settings.templateId === "water-treatment-materials/v1"
       ? "water-treatment-materials/v1"
       : "scientific-hypothesis-general/v1",
@@ -23,7 +25,7 @@ export function createIdeaTreeSettingsDraft(settings: IdeaTreeSettingsDetails): 
 }
 
 export function ideaTreeSettingsRequest(draft: IdeaTreeSettingsDraft): UpdateIdeaTreeSettingsRequest {
-  return { templateId: draft.templateId, explorationIntensity: draft.explorationIntensity };
+  return { templateId: draft.templateId, explorationIntensity: draft.explorationIntensity, ...(draft.candidateValidationEnabled === undefined ? {} : { candidateValidationEnabled: draft.candidateValidationEnabled }) };
 }
 
 export function IdeaTreeSettingsEditor({
@@ -68,6 +70,11 @@ export function IdeaTreeSettingsEditor({
         </select>
       </label>
     </div>
+    <label>
+      <input type="checkbox" checked={draft.candidateValidationEnabled === true}
+        onChange={(event) => onChange({ ...draft, candidateValidationEnabled: event.target.checked })} />
+      {t("ideaTree.validation.enabled")}
+    </label>
     <p className="config-note">{t("ideaTree.templateSnapshot")}</p>
     <div className="settings-actions">
       <button className="primary-button" disabled={saving} onClick={onSave} type="button">

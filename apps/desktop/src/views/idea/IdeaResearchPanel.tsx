@@ -25,10 +25,12 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { CandidateValidationPanel } from "@sciencediscovery/configuration-ui";
 import type { IdeaResearchView, IdeaTreeNode } from "@sciencediscovery/schema";
 import type { ApiClient } from "../../api/client.js";
 import { ApiRequestError } from "../../api/client.js";
-import { controlIdeaResearch, getIdeaResearch, subscribeIdeaResearchEvents } from "../../api/idea-tree.js";
+import { controlIdeaResearch, getIdeaResearch, listIdeaValidationInputs, subscribeIdeaResearchEvents, ideaExperiment } from "../../api/idea-tree.js";
+import { readArtifactVersion } from "../../api/sessions.js";
 import { TEXT } from "../../text.js";
 import { IdeaNodeDetail, IdeaTreeView } from "./IdeaTree.js";
 
@@ -148,7 +150,12 @@ export function IdeaResearchPanel({ client, sessionId, researchId, onClose, onRe
     };
   }, [client, researchId, sessionId, status, load, resubscribe]);
 
-  const control = async (operation: "pause" | "continue" | "end") => {
+  const loadValidationOutputs = useCallback(() => listIdeaValidationInputs(client, sessionId, researchId), [client, sessionId, researchId]);
+
+  const experiment = useCallback((input: Record<string, unknown>) => ideaExperiment(client, sessionId, input), [client, sessionId]);
+  const reloadValidation = useCallback(() => { void load(); }, [load]);
+
+  const control = async (operation: "pause" | "pause_for_validation" | "continue" | "end") => {
     setBusy(true);
     setError(undefined);
     try {
@@ -229,10 +236,29 @@ export function IdeaResearchPanel({ client, sessionId, researchId, onClose, onRe
       ) : null}
       <div className="idea-panel-body">
         <IdeaTreeView graph={view.graph} onSelect={(node) => setSelectedId(node.id)} selectedId={selectedId} />
-        {selectedNode ? <IdeaNodeDetail node={selectedNode} /> : null}
+        {selectedNode ? <div>
+          <IdeaNodeDetail node={selectedNode} />
+          {research.settings.candidateValidationEnabled && selectedNode.kind === "candidate" && <CandidateValidationPanel
+            key={`${researchId}:${selectedNode.id}`} researchId={researchId} candidateId={selectedNode.id}
+            results={selectedNode.validations ?? []} evidenceIds={selectedNode.basedOnValidationIds} locale="zh"
+            onSelectEvidence={id => {
+              const source = view.graph.nodes.find((item: IdeaTreeNode) => item.validations?.some((result) => result.id === id)
+                || item.validationFailures?.some((failure) => failure.id === id));
+              if (source) setSelectedId(source.id);
+            }}
+            maySubmit={(canResume || research.status === "completed") && selectedNode.status === "done"} disabled={busy} loadOutputs={loadValidationOutputs}
+            experiment={experiment} onAttached={reloadValidation} openVersion={async id => {
+              const artifact = await readArtifactVersion(client, sessionId, id);
+              return new Blob([new Uint8Array(artifact.bytes)], { type: artifact.mediaType });
+            }} />}
+        </div> : null}
       </div>
       <footer className="idea-panel-actions">
         {research.status === "running" ? <button className="secondary-button" disabled={busy} onClick={() => void control("pause")} type="button">{t.pause}</button> : null}
+        {research.settings.candidateValidationEnabled && research.status === "running" && research.round < research.settings.maxRounds &&
+          <button className="secondary-button" disabled={busy || research.pauseForValidation} onClick={() => void control("pause_for_validation")} type="button">
+            {research.pauseForValidation ? "等待本轮完成" : "本轮完成后暂停验证"}
+          </button>}
         {canResume ? <button className="secondary-button" disabled={busy} onClick={() => void control("continue")} type="button">{t.resume}</button> : null}
         {LIVE.includes(research.status) || canResume || research.status === "paused"
           ? (confirmEnd

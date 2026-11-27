@@ -26,6 +26,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { appendFile, mkdir, open, readFile, readdir, realpath, rename, rm, stat, truncate, writeFile } from "node:fs/promises";
 import { createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
+import { setTimeout as delay } from "node:timers/promises";
 import { mergePluginSettings } from "@sciencediscovery/plugin-sdk";
 import { replaceFile } from "./atomic-file.js";
 import { installedPlugins } from "./plugins/catalog.js";
@@ -2329,12 +2330,28 @@ export class SessionStore {
   }
 
   private async readArray<T>(path: string): Promise<T[]> {
-    try {
-      return JSON.parse(await readFile(path, "utf8")) as T[];
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
-      throw error;
+    // The data directory can live on a Windows-mounted filesystem while the
+    // API runs inside WSL. A reader may briefly observe the target during the
+    // temp-file replacement, which surfaces as ENODATA or an empty/partial
+    // JSON read even though the writer has an intact previous or next copy.
+    // Retry that narrow transient window so a status poll cannot turn a
+    // completed run into an HTTP 500.
+    const transientCodes = new Set(["EACCES", "EBUSY", "EAGAIN", "ENODATA", "ENOENT", "EPERM"]);
+    const attempts = 8;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      try {
+        return JSON.parse(await readFile(path, "utf8")) as T[];
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        const transientJson = error instanceof SyntaxError;
+        if ((!transientCodes.has(code ?? "") && !transientJson) || attempt === attempts - 1) {
+          if (code === "ENOENT") return [];
+          throw error;
+        }
+        await delay(Math.min(100, 2 ** attempt));
+      }
     }
+    return [];
   }
 
   /** Every array write in flight, registered where the write happens rather than
@@ -7374,6 +7391,7 @@ export class SessionStore {
   }
 
   async createSessionRun(input: {
+    candidatePreparation?: SessionRun["candidatePreparation"];
     notificationDelivery?: SessionRun["notificationDelivery"];
     automaticWake?: boolean;
     wakeAfterRunId?: string;
@@ -7396,6 +7414,7 @@ export class SessionStore {
     // latest array inside the barrier for the same reason.
     return await this.mutateArray<SessionRun, SessionRun>(this.sessionRunsPath(input.sessionId), (runs) => {
       const run: SessionRun = {
+        ...(input.candidatePreparation ? { candidatePreparation: structuredClone(input.candidatePreparation) } : {}),
         ...(input.notificationDelivery ? { notificationDelivery: structuredClone(input.notificationDelivery) } : {}),
         ...(input.automaticWake ? { automaticWake: true } : {}),
         ...(input.wakeAfterRunId ? { wakeAfterRunId: input.wakeAfterRunId } : {}),

@@ -21,6 +21,8 @@ log = get_logger('idea_research')
 
 
 class Settings(BaseModel):
+    candidateValidationEnabled: bool = False
+    candidateValidationFeedbackEnabled: bool = True
     templateId: str = 'scientific-hypothesis-general/v1'
     explorationIntensity: str = 'standard'
     maxRounds: int = Field(default=3, ge=1, le=100)
@@ -64,6 +66,8 @@ class Command(BaseModel):
     settings: Settings = Field(default_factory=Settings)
     modelId: str = ''
     llm: dict = Field(default_factory=dict)
+    candidateId: str = ''
+    validation: dict | None = None
 
 
 router = APIRouter(prefix='/idea-tree/research', dependencies=[Depends(require_internal_token)])
@@ -112,9 +116,10 @@ def settle_after_restart(state):
     existed are read.
     """
     pending = state.pop('pendingStop', None)
+    checkpoint_requested = state.pop('pauseForValidation', False)
     if pending == 'end':
         state.update(status='ended', reason='Ended by user')
-    elif pending == 'pause':
+    elif pending == 'pause' or checkpoint_requested:
         state.update(status='paused', reason='Paused by user')
     else:
         state.update(status='interrupted', reason=RESTART_REASON)
@@ -232,6 +237,46 @@ async def command(c: Command):
         s = state_for(c.projectId, c.sessionId, c.researchId)
         if c.operation == 'get':
             return view(s)
+        if c.operation == 'pause_for_validation':
+            if not s['settings'].get('candidateValidationEnabled') or s['status'] != 'running' or s['id'] not in _running:
+                raise HTTPException(409, 'Research cannot schedule a validation checkpoint')
+            if s['round'] >= s['settings']['maxRounds']:
+                raise HTTPException(409, 'Research is in its final round')
+            if not s.get('pauseForValidation'):
+                s['pauseForValidation'] = True
+                store().save(s)
+            return view(s)
+        if c.operation in ('attach_validation', 'attach_validation_failure'):
+            if not s['settings'].get('candidateValidationEnabled'):
+                raise HTTPException(409, 'Candidate validation is disabled for this research')
+            if s['status'] not in ('paused', 'interrupted', 'completed') or s['id'] in _running:
+                raise HTTPException(409, 'Wait for a checkpoint or for the research to complete before attaching validation')
+            target = next((n for n in s['nodes'] if n['id'] == c.candidateId and n['kind'] == 'candidate'), None)
+            if not target or target['status'] != 'done' or not c.validation or not c.validation.get('id'):
+                raise HTTPException(422, 'Select an evaluated candidate and a valid comparison')
+            if c.operation == 'attach_validation_failure':
+                observation = c.validation
+                if observation.get('stage') not in ('baseline_execution', 'candidate_execution', 'scoring') or observation.get('code') not in ('execution_failed', 'timeout', 'invalid_predictions'):
+                    raise HTTPException(422, 'Invalid experiment failure observation')
+                results = target.setdefault('validationFailures', [])
+                current = next((item for item in results if item['id'] == observation['id']), None)
+                if current is not None and current != observation:
+                    raise HTTPException(409, 'Conflicting validation failure')
+                if current is None:
+                    results.append(observation)
+                    del results[:-10]
+                    store().save(s)
+                return view(s)
+            results = target.setdefault('validations', [])
+            existing = next((item for item in results if item['id'] == c.validation['id']), None)
+            if existing is not None and existing != c.validation:
+                raise HTTPException(409, 'Conflicting validation result')
+            if existing is None:
+                if len(results) >= 10:
+                    raise HTTPException(409, 'This candidate already has ten comparisons')
+                results.append(c.validation)
+                store().save(s)
+            return view(s)
         if c.operation == 'continue':
             if s['status'] == 'budget_exhausted':
                 raise HTTPException(409, 'Research exhausted its token budget; increase the token limit and start a new research')
@@ -245,6 +290,7 @@ async def command(c: Command):
                 return view(s)
             active = _running.get(s['id'])
             if active:
+                s.pop('pauseForValidation', None)
                 active[0].stop_action = c.operation
                 # The engine still owns the settle, so the runtime status stays
                 # `pausing` and the SSE stream keeps running. Persisting the request

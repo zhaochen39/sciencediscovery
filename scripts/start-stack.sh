@@ -278,6 +278,9 @@ configure_endpoints() {
   local runner_host="${SCIENCE_AGENT_RUNNER_HOST:-127.0.0.1}"
   local runner_port="${SCIENCE_AGENT_RUNNER_PORT:-4311}"
   runner_url="${SCIENCE_AGENT_RUNNER_URL:-http://$runner_host:$runner_port}"
+  # The API and the JiuwenSwarm adapter must use the same Runner that the
+  # stack health check probes, especially when several local stacks coexist.
+  export SCIENCE_AGENT_RUNNER_URL="$runner_url"
 }
 
 # Restore the lockfile a mirror sync backed up. Driven by a trap rather than by

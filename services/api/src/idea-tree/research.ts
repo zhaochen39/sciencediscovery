@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
-import type { IdeaResearchView } from "@sciencediscovery/schema";
+import type { CasStore } from "@sciencediscovery/cas";
+import { evaluateCandidateValidation } from "./validation.js";
+import type { IdeaResearchView, SessionArtifactOutput } from "@sciencediscovery/schema";
 import type { SessionStore } from "../store.js";
 import type { RunTokenRegistry } from "../evolution/llm-proxy.js";
 
@@ -9,6 +11,8 @@ import type { RunTokenRegistry } from "../evolution/llm-proxy.js";
  * carries the terminal frame, and the sweep below leaves it alone.
  */
 const RETIRE_SWEEP_MS = 5000;
+
+export class ResearchTransportError extends Error {}
 
 /** The research states a stream stays open for; anything else is terminal. */
 function terminal(status: unknown): boolean {
@@ -33,7 +37,9 @@ export function createIdeaResearchClient(options: {
     grants.delete(researchId);
   }
   async function invoke(sessionId: string, operation: string, input: Record<string, unknown> = {}): Promise<any> {
-    const target = await connection();
+    const target = await connection().catch((error: unknown) => {
+      throw new ResearchTransportError(error instanceof Error ? error.message : "Research service unavailable", { cause: error });
+    });
     const session = operation === "list" || operation === "get" || operation === "defaults"
       ? options.store.getSession(sessionId) : options.store.assertSessionWritable(sessionId);
     if (!session) throw new Error("Session not found");
@@ -62,10 +68,23 @@ export function createIdeaResearchClient(options: {
       const token = options.tokens.issue(researchId, sessionId, model.id);
       grants.set(researchId, { sessionId, token });
       issued = researchId;
+      const sessionSettings = operation === "create" ? options.store.resolveIdeaTreeSettings(sessionId) : undefined;
+      const researchSettings = sessionSettings ? { ...sessionSettings, ...(input.settings as object ?? {}) } : undefined;
+      if (researchSettings) {
+        // The user-facing session setting is authoritative for the opt-in.
+        const validationRequested = (input.settings as { candidateValidationEnabled?: boolean } | undefined)?.candidateValidationEnabled;
+        const feedbackEnabled = (researchSettings as { candidateValidationFeedbackEnabled?: boolean }).candidateValidationFeedbackEnabled;
+        delete (researchSettings as { candidateValidationFeedbackEnabled?: boolean }).candidateValidationFeedbackEnabled;
+        delete researchSettings.candidateValidationEnabled;
+        if (sessionSettings?.candidateValidationEnabled === true && validationRequested !== false) {
+          researchSettings.candidateValidationEnabled = true;
+          if (feedbackEnabled === false) Object.assign(researchSettings, { candidateValidationFeedbackEnabled: false });
+        }
+      }
       payload = { ...payload, researchId, modelId: model.id,
         // The Session's own parameters come first: this is where a research is
         // created, and the card promises the next research here uses them.
-        ...(operation === "create" ? { settings: { ...options.store.resolveIdeaTreeSettings(sessionId), ...(input.settings as object ?? {}) } } : {}),
+        ...(researchSettings ? { settings: researchSettings } : {}),
         llm: { token, url: `${options.apiOrigin}/internal/evolve-llm/${researchId}/v1/chat/completions` } };
     }
     try {
@@ -73,8 +92,11 @@ export function createIdeaResearchClient(options: {
       const response = await fetch(`${target.url.replace(/\/$/, "")}/idea-tree/research/command`, {
         method: "POST", headers: { "content-type": "application/json", ...(target.internalToken ? { authorization: `Bearer ${target.internalToken}` } : {}) },
         body: JSON.stringify(payload), signal: AbortSignal.timeout(15_000),
-      });
-      const body = await response.json() as any;
+      }).catch((error: unknown) => { throw new ResearchTransportError("Research service connection lost", { cause: error }); });
+      if ([502, 503, 504].includes(response.status)) throw new ResearchTransportError(`Research service unavailable: HTTP ${response.status}`);
+      const body = await response.json().catch((error: unknown) => {
+        throw new ResearchTransportError("Research service response could not be read", { cause: error });
+      }) as any;
       if (!response.ok) throw new Error(typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail));
       const views: IdeaResearchView[] = body.items ?? (body.research ? [body] : []);
       for (const view of views) {
@@ -104,6 +126,40 @@ export function createIdeaResearchClient(options: {
     if (mutation) pending.add(sessionId);
     try { return await invoke(sessionId, operation, input); }
     finally { if (mutation) pending.delete(sessionId); }
+  }
+  async function validationInputs(sessionId: string, researchId: string): Promise<SessionArtifactOutput[]> {
+    const view: IdeaResearchView = await invoke(sessionId, "get", { researchId });
+    if (!view.research.settings.candidateValidationEnabled) throw new Error("Candidate validation is disabled for this research");
+    return options.store.listArtifacts(sessionId).flatMap(artifact =>
+      options.store.listArtifactVersions(sessionId, artifact.id)
+        .filter(version => version.sessionId === sessionId
+          && (version.mediaType === "application/json" || version.mediaType === "text/x-python" || /\.(json|py)$/iu.test(version.sourcePath ?? "")))
+        .map(version => ({ artifact, version })));
+  }
+  async function validateCandidate(sessionId: string, cas: CasStore, input: Record<string, unknown>, plan?: { digest: string; seed: number }): Promise<IdeaResearchView> {
+    const { researchId, candidateId } = input;
+    if (typeof researchId !== "string" || typeof candidateId !== "string") throw new Error("Choose a research and candidate");
+    if (pending.has(sessionId)) throw new Error("Another research control request is in progress");
+    pending.add(sessionId);
+    try {
+      const session = options.store.assertSessionWritable(sessionId);
+      const view: IdeaResearchView = await invoke(sessionId, "get", { researchId });
+      if (!view.research.settings.candidateValidationEnabled) throw new Error("Candidate validation is disabled for this research");
+      if (!["paused", "interrupted", "completed"].includes(view.research.status)) throw new Error("Wait for a checkpoint or for the research to complete before validating a candidate");
+      if (!view.graph.nodes.some(node => node.id === candidateId && node.kind === "candidate" && node.status === "done")) {
+        throw new Error("Choose an evaluated candidate from this research");
+      }
+      const validation = await evaluateCandidateValidation(options.store, cas, sessionId, session.projectId, input);
+      if (plan) {
+        validation.planDigest = plan.digest;
+        validation.seed = plan.seed;
+        validation.environmentRevisionId = (await options.store.listExecutionRuns(sessionId))
+          .find(run => run.id === validation.candidateExecutionId)?.environmentRevisionId ?? undefined;
+      }
+      return await invoke(sessionId, "attach_validation", { researchId, candidateId, validation });
+    } finally {
+      pending.delete(sessionId);
+    }
   }
   async function cleanup(projectId: string, sessionId: string) {
     if (!options.url && !options.connection) return;
@@ -192,5 +248,5 @@ export function createIdeaResearchClient(options: {
       id: n.id, hypothesis: n.hypothesis, status: n.status, score: n.score, insight: n.insight,
     })), insight: view.graph.nodes.find(n => n.id === "ROOT")?.insight };
   }
-  return { command, cleanup, events, summary, close() { clearInterval(timer); for (const id of [...grants.keys()]) retire(id); } };
+  return { command, validationInputs, validateCandidate, cleanup, events, summary, close() { clearInterval(timer); for (const id of [...grants.keys()]) retire(id); } };
 }

@@ -150,6 +150,18 @@ export class ArtifactsApiClient extends RunsApiClient {
     return this.request(`/api/sessions/${encodeURIComponent(sessionId)}/idea-tree/research`);
   }
 
+  ideaExperiment(sessionId: string, body: Record<string, unknown>): Promise<import("@sciencediscovery/schema").CandidateExperiment | import("@sciencediscovery/schema").CandidateExperiment[] | import("@sciencediscovery/schema").CandidatePreparationResult | null> {
+    return this.request(`/api/sessions/${encodeURIComponent(sessionId)}/idea-tree/experiments`, {
+      method: "POST", body: JSON.stringify(body),
+    });
+  }
+
+  ideaValidationInputs(sessionId: string, researchId: string): Promise<SessionArtifactOutput[]> {
+    return this.request(`/api/sessions/${encodeURIComponent(sessionId)}/idea-tree/research`, {
+      method: "POST", body: JSON.stringify({ operation: "validation_inputs", researchId }),
+    });
+  }
+
   ideaResearchCommand(sessionId: string, body: Record<string, unknown>): Promise<import("@sciencediscovery/schema").IdeaResearchView> {
     return this.request(`/api/sessions/${encodeURIComponent(sessionId)}/idea-tree/research`, {method: "POST", body: JSON.stringify(body)});
   }

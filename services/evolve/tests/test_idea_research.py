@@ -101,6 +101,36 @@ class ResearchTests(unittest.IsolatedAsyncioTestCase):
             value = dict(text=f'{role} output')
         return json.dumps(value), 100
 
+    async def test_checkpoint_keeps_validation_in_next_ideation_only(self):
+        self.state['settings'].update(candidateValidationEnabled=True, maxRounds=2, maxSearchRounds=2)
+        self.state['pauseForValidation'] = True
+        await IdeaTreeEngine(self.state, self.store, {}, self.model).run()
+        self.assertEqual(self.state['status'], 'paused')
+        self.assertEqual(self.state['round'], 1)
+        self.assertEqual(self.state['batch'], [])
+        candidate = next(n for n in self.state['nodes'] if n['kind'] == 'candidate')
+        self.assertEqual(candidate['status'], 'done')
+        candidate['validations'] = [dict(
+            id='validation-test', metric='mae', baseline=0.2, candidate=0.4, improvement=-0.2,
+            referenceVersionId='development-v1', sampleCount=50, baselineArtifactId='baseline',
+            candidateArtifactId='candidate', candidateExecutionId='run-candidate',
+        )]
+        self.store.save(self.state)
+        restored = self.store.read('p', 's', self.state['id'])
+        engine = IdeaTreeEngine(restored, self.store, {}, self.model)
+        await engine.run()
+        self.assertEqual(restored['status'], 'completed')
+        ideation = [payload for role, payload in self.calls if role == 'ideate']
+        self.assertNotIn('candidateValidation', ideation[0])
+        evidence = ideation[1]['candidateValidation'][0]
+        self.assertEqual(evidence['candidateId'], candidate['id'])
+        self.assertEqual(evidence['improvement'], -0.2)
+        self.assertEqual(evidence['referenceVersionId'], 'development-v1')
+        self.assertNotIn('candidateExecutionId', evidence)
+        self.assertTrue(all('candidateValidation' not in payload for role, payload in self.calls if role != 'ideate'))
+        restored['settings'].pop('candidateValidationEnabled')
+        self.assertEqual(engine.experiment_feedback(), {})
+
     def test_initial_exploit_requires_explore_even_with_fabricated_lineage(self):
         engine = IdeaTreeEngine(self.state, self.store, {}, self.model)
         with self.assertRaisesRegex(ValueError, 'Use explorationType=explore'):

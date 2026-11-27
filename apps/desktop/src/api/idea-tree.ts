@@ -31,7 +31,7 @@
  * entry has not been designed yet, which is not a score of 0.
  */
 
-import type { IdeaResearchFrame, IdeaResearchState, IdeaResearchView, IdeaTreeGraph } from "@sciencediscovery/schema";
+import type { CandidateExperiment, SessionArtifactOutput, IdeaResearchFrame, IdeaResearchState, IdeaResearchView, IdeaTreeGraph } from "@sciencediscovery/schema";
 import { applyIdeaResearchFrame, reconcileIdeaResearchFrame } from "@sciencediscovery/schema";
 import type { ApiClient } from "./client.js";
 import { SseFrameDecoder } from "./stream.js";
@@ -66,7 +66,7 @@ export async function getIdeaResearch(client: ApiClient, sessionId: string, rese
   });
 }
 
-export type IdeaResearchControl = "pause" | "continue" | "end";
+export type IdeaResearchControl = "pause" | "pause_for_validation" | "continue" | "end";
 
 /** Pause, continue or end one research. The engine answers with the new view. */
 export async function controlIdeaResearch(
@@ -78,6 +78,18 @@ export async function controlIdeaResearch(
   return await client.request<IdeaResearchView>(`/api/sessions/${encodeURIComponent(sessionId)}/idea-tree/research`, {
     method: "POST",
     body: JSON.stringify({ operation, researchId }),
+  });
+}
+
+export function listIdeaValidationInputs(client: ApiClient, sessionId: string, researchId: string): Promise<SessionArtifactOutput[]> {
+  return client.request(`/api/sessions/${encodeURIComponent(sessionId)}/idea-tree/research`, {
+    method: "POST", body: JSON.stringify({ operation: "validation_inputs", researchId }),
+  });
+}
+
+export function ideaExperiment(client: ApiClient, sessionId: string, input: Record<string, unknown>): Promise<CandidateExperiment | CandidateExperiment[] | import("@sciencediscovery/schema").CandidatePreparationResult | null> {
+  return client.request(`/api/sessions/${encodeURIComponent(sessionId)}/idea-tree/experiments`, {
+    method: "POST", body: JSON.stringify(input),
   });
 }
 

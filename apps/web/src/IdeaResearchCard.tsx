@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { CandidateValidationPanel } from "@sciencediscovery/configuration-ui";
 import type { IdeaResearchView } from "@sciencediscovery/schema";
 import type { ApiClient } from "./api.js";
 import { isAuthFailure } from "./api/auth.js";
@@ -31,7 +32,7 @@ function keepLatestView(incoming: IdeaResearchView, current?: IdeaResearchView):
 }
 
 export function IdeaResearchCard({client, sessionId, onError, onResearchAvailability}: {client: ApiClient; sessionId: string; onError: (reason: string | Error) => void; onResearchAvailability?: (available: boolean) => void}) {
-  const { t } = useLocale();
+  const { t, locale } = useLocale();
   const element = useRef<HTMLElement>(null);
   const [items, setItems] = useState<IdeaResearchView[]>([]);
   const [selected, setSelected] = useState<string>();
@@ -170,6 +171,11 @@ export function IdeaResearchCard({client, sessionId, onError, onResearchAvailabi
     finally {setBusy(false);}
   }
   const view = items.find(i => i.research.id === selected) ?? items[0];
+  const validationResearchId = view?.research.id;
+  const loadValidationOutputs = useCallback(() => validationResearchId
+    ? client.ideaValidationInputs(sessionId, validationResearchId) : Promise.resolve([]), [client, sessionId, validationResearchId]);
+  const experiment = useCallback((input: Record<string, unknown>) => client.ideaExperiment(sessionId, input), [client, sessionId]);
+  const reloadValidation = useCallback(() => { void loadRef.current(); }, []);
   if (!view) return error ? <p role="alert">{error} <button className="secondary-button compact-button" type="button" onClick={() => void load()}>{t("ideaResearch.retry")}</button></p> : null;
   const r = view.research;
   // A spent budget is terminal: explain the used/limit tokens and never offer an
@@ -190,6 +196,16 @@ export function IdeaResearchCard({client, sessionId, onError, onResearchAvailabi
       <span className="idea-tree-view-action">{t("ideaResearch.viewProgress")}</span>
     </button>
     {open && <IdeaTreeExplorer autonomous graph={view.graph} treeIds={items.map(i => i.research.id)} onClose={() => setOpen(false)} onSelectTree={setSelected}
+      renderCandidateValidation={r.settings.candidateValidationEnabled ? (node, selectNode) => <CandidateValidationPanel
+        key={`${r.id}:${node.id}`} researchId={r.id} candidateId={node.id} results={node.validations ?? []} evidenceIds={node.basedOnValidationIds} locale={locale.startsWith("zh") ? "zh" : "en"}
+        maySubmit={node.status === "done" && ["paused", "interrupted", "completed"].includes(r.status)}
+        onSelectEvidence={id => {
+          const source = view.graph.nodes.find(item => item.validations?.some(result => result.id === id)
+            || item.validationFailures?.some(failure => failure.id === id));
+          if (source) selectNode(source.id);
+        }}
+        disabled={busy} loadOutputs={loadValidationOutputs}
+        experiment={experiment} onAttached={reloadValidation} openVersion={id => client.readArtifactVersion(sessionId, id)} /> : undefined}
       controls={<div className="idea-research-progress">
         <p>{ideaResearchStatusLabel(t, r.status)} · {t("ideaResearch.round", {round: r.round, total: r.settings.maxRounds})} · {t("ideaResearch.batchProgress", {completed: r.batchCompleted, total: r.batch.length || r.batchCompleted})}</p>
         {r.unreportedBudgetEstimate ? <p>{t("ideaResearch.unreportedBudgetEstimate", { count: r.unreportedBudgetEstimate })}</p> : null}
@@ -204,6 +220,10 @@ export function IdeaResearchCard({client, sessionId, onError, onResearchAvailabi
         </ol>
         <div className="idea-research-actions">
           {r.status === "running" && <button className="secondary-button" type="button" disabled={busy} onClick={() => void command("pause", r.id)}>{t("ideaResearch.pause")}</button>}
+          {r.settings.candidateValidationEnabled && r.status === "running" && r.round < r.settings.maxRounds &&
+            <button className="secondary-button" type="button" disabled={busy || r.pauseForValidation} onClick={() => void command("pause_for_validation", r.id)}>
+              {t(r.pauseForValidation ? "ideaTree.validation.checkpointPending" : "ideaTree.validation.checkpoint")}
+            </button>}
           {["paused", "interrupted"].includes(r.status) && <button className="secondary-button" type="button" disabled={busy} onClick={() => void command("continue", r.id)}>{t("ideaResearch.continue")}</button>}
           {!["completed", "ended", "budget_exhausted"].includes(r.status) && <button className="secondary-button" type="button" disabled={busy} onClick={() => setConfirmEnd(r.id)}>{t("ideaResearch.end")}</button>}
         </div>
